@@ -1,0 +1,15 @@
+# Mirrors bench/bench.py workload 'max': highest throughput. OMB has no unthrottled mode: producerRate 0 makes it search for the
+# maximum sustainable rate (the local run drives one unthrottled producer instead).
+# Every workload: 1 KB records, 100 partitions, RF 3, acks=all, min.insync.replicas=2 (set in the driver files).
+name: max
+topics: 1
+partitionsPerTopic: 100
+messageSize: 1024
+payloadFile: payload/payload-1Kb.data
+subscriptionsPerTopic: 1
+producersPerTopic: 4
+consumerPerSubscription: 4
+warmupDurationMinutes: 5
+testDurationMinutes: 15
+producerRate: 0
+keyDistributor: NO_KEY

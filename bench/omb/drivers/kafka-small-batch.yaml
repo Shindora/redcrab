@@ -1,0 +1,17 @@
+# OpenMessaging Benchmark driver: Apache Kafka 4.4.0, default durability (page cache, no fsync per write).
+# Use with workloads/small-batch.yaml only. Client settings mirror bench/bench.py; point bootstrap.servers at the real cluster.
+name: kafka-small-batch
+driverClass: io.openmessaging.benchmark.driver.kafka.KafkaBenchmarkDriver
+replicationFactor: 3
+topicConfig: |
+  min.insync.replicas=2
+commonConfig: |
+  bootstrap.servers=localhost:9092
+producerConfig: |
+  acks=all
+  linger.ms=0
+  batch.size=16384
+consumerConfig: |
+  auto.offset.reset=earliest
+  enable.auto.commit=false
+  fetch.max.bytes=16777216

@@ -1,0 +1,17 @@
+name: bench
+x-redpanda: &redpanda
+  image: ${REDPANDA_IMAGE:?set by bench.py}
+  mem_limit: ${BROKER_MEM_LIMIT:?set by bench.py}
+  entrypoint: [/bin/bash, -c]
+  command:
+    - >-
+      rpk redpanda config set redpanda.developer_mode false &&
+      rpk redpanda config set redpanda.empty_seed_starts_cluster false &&
+      exec rpk redpanda start --overprovisioned --smp=1 --memory=${REDPANDA_MEMORY:?set by bench.py} --reserve-memory=0M --check=false
+      --kafka-addr=PLAINTEXT://0.0.0.0:9092 --advertise-kafka-addr=PLAINTEXT://$${HOSTNAME}:9092
+      --rpc-addr=0.0.0.0:33145 --advertise-rpc-addr=$${HOSTNAME}:33145
+      --seeds=bench-1:33145,bench-2:33145,bench-3:33145
+services:
+  bench-1: {<<: *redpanda, container_name: bench-1, hostname: bench-1}
+  bench-2: {<<: *redpanda, container_name: bench-2, hostname: bench-2}
+  bench-3: {<<: *redpanda, container_name: bench-3, hostname: bench-3}

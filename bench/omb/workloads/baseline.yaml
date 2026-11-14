@@ -1,0 +1,14 @@
+# Mirrors bench/bench.py workload 'baseline': fixed-rate open loop (local default 10k msg/s).
+# Every workload: 1 KB records, 100 partitions, RF 3, acks=all, min.insync.replicas=2 (set in the driver files).
+name: baseline
+topics: 1
+partitionsPerTopic: 100
+messageSize: 1024
+payloadFile: payload/payload-1Kb.data
+subscriptionsPerTopic: 1
+producersPerTopic: 4
+consumerPerSubscription: 4
+warmupDurationMinutes: 5
+testDurationMinutes: 15
+producerRate: 50000
+keyDistributor: NO_KEY

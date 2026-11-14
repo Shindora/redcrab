@@ -1,0 +1,15 @@
+# Mirrors bench/bench.py workload 'small-batch': random keys, linger.ms=0, batch.size=16384 (local default 1k msg/s).
+# Run with the drivers/*-small-batch.yaml files, which carry the small-batch producer settings.
+# Every workload: 1 KB records, 100 partitions, RF 3, acks=all, min.insync.replicas=2 (set in the driver files).
+name: small-batch
+topics: 1
+partitionsPerTopic: 100
+messageSize: 1024
+payloadFile: payload/payload-1Kb.data
+subscriptionsPerTopic: 1
+producersPerTopic: 4
+consumerPerSubscription: 4
+warmupDurationMinutes: 5
+testDurationMinutes: 15
+producerRate: 10000
+keyDistributor: RANDOM_NANO

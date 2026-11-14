@@ -1,0 +1,19 @@
+# OpenMessaging Benchmark driver: Redpanda v26.2.7 with write caching off; also confirm `rpk cluster config get write_caching_default` prints false.
+# min.insync.replicas is accepted but Redpanda acks=all waits for a Raft majority (2 of 3).
+# Use with workloads/baseline.yaml, max.yaml and backlog.yaml. Client settings mirror bench/bench.py; point bootstrap.servers at the real cluster.
+name: redpanda
+driverClass: io.openmessaging.benchmark.driver.kafka.KafkaBenchmarkDriver
+replicationFactor: 3
+topicConfig: |
+  min.insync.replicas=2
+  write.caching=false
+commonConfig: |
+  bootstrap.servers=localhost:9092
+producerConfig: |
+  acks=all
+  linger.ms=1
+  batch.size=131072
+consumerConfig: |
+  auto.offset.reset=earliest
+  enable.auto.commit=false
+  fetch.max.bytes=16777216

@@ -1,0 +1,16 @@
+# Mirrors bench/bench.py workload 'backlog': consumers start once a backlog exists and drain it while producers keep writing at
+# producerRate (local: 50k x seconds records pre-filled, 5k msg/s live producer).
+# Every workload: 1 KB records, 100 partitions, RF 3, acks=all, min.insync.replicas=2 (set in the driver files).
+name: backlog
+topics: 1
+partitionsPerTopic: 100
+messageSize: 1024
+payloadFile: payload/payload-1Kb.data
+subscriptionsPerTopic: 1
+producersPerTopic: 4
+consumerPerSubscription: 4
+warmupDurationMinutes: 5
+testDurationMinutes: 15
+producerRate: 50000
+consumerBacklogSizeGB: 50
+keyDistributor: NO_KEY
