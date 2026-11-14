@@ -21,7 +21,7 @@ use kafka_protocol::messages::sync_group_request::SyncGroupRequestAssignment;
 use kafka_protocol::messages::{
     ApiVersionsRequest, CreateTopicsRequest, DescribeConfigsRequest, DescribeGroupsRequest,
     FetchRequest, FindCoordinatorRequest, GroupId, HeartbeatRequest, JoinGroupRequest,
-    JoinGroupResponse, LeaveGroupRequest, ListGroupsRequest, OffsetCommitRequest,
+    JoinGroupResponse, LeaveGroupRequest, ListGroupsRequest, MetadataRequest, OffsetCommitRequest,
     OffsetFetchRequest, ProduceRequest, ProduceResponse, RequestHeader, ResponseHeader,
     SyncGroupRequest, SyncGroupResponse, TopicName,
 };
@@ -729,6 +729,47 @@ async fn group_apis_answer_at_oldest_versions() {
         )
         .await;
     assert_eq!(left.error_code, 0);
+}
+
+/// A Metadata request whose topics array claims more elements than any frame could hold: a compact
+/// count of 2^32 - 2 at v12, and a count of `i32::MAX` at v1. Each must close only its own connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn absurd_array_count_closes_connection_and_broker_stays_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, _server) = start(dir.path());
+    let crafted: [(i16, &[u8]); 2] = [
+        (12, &[0xff, 0xff, 0xff, 0xff, 0x0f]),
+        (1, &i32::MAX.to_be_bytes()),
+    ];
+    for (version, topics_count) in crafted {
+        let mut frame = BytesMut::new();
+        frame.put_i32(0);
+        RequestHeader::default()
+            .with_request_api_key(MetadataRequest::KEY)
+            .with_request_api_version(version)
+            .with_correlation_id(1)
+            .encode(&mut frame, MetadataRequest::header_version(version))
+            .unwrap();
+        frame.put_slice(topics_count);
+        let len = i32::try_from(frame.len() - 4).unwrap();
+        frame[..4].copy_from_slice(&len.to_be_bytes());
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(&frame).await.unwrap();
+        let mut reply = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut reply))
+            .await
+            .expect("broker must close the connection");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "Metadata v{version} with an absurd array count got a reply: {reply:?}"
+        );
+    }
+    let versions = Client::connect(port)
+        .await
+        .call(&ApiVersionsRequest::default(), 3)
+        .await;
+    assert_eq!(versions.error_code, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

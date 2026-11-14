@@ -11,8 +11,8 @@ and it was built before the broker.
 > [!WARNING]
 > **Status: pre-alpha. Single node only. Not for production.**
 > redcrab runs as one node and does not replicate data. There is no redundancy: if the disk or the host is lost,
-> the data is lost. It has no TLS, no authentication and no authorization. A known parsing issue means a crafted
-> request can crash it on Linux (see [Security and known issues](#security-and-known-issues)). Do not put
+> the data is lost. It has no TLS, no authentication and no authorization. A known parsing issue means a large crafted
+> request can still crash it on Linux (see [Security and known issues](#security-and-known-issues)). Do not put
 > production data on it, and do not expose it to untrusted networks. It has been tested on macOS and, in the benchmark harness, in a Linux arm64 container.
 
 ## Contents
@@ -78,7 +78,7 @@ There are no prebuilt binaries or container images yet. You build redcrab from s
 
 ### Build and run
 
-You need a Rust toolchain that supports edition 2024 (`Cargo.toml` declares `rust-version = "1.85"`).
+You need a Rust toolchain that supports edition 2024 (`Cargo.toml` declares `rust-version = "1.89"`).
 
 ```sh
 git clone https://github.com/Shindora/redcrab.git
@@ -649,12 +649,16 @@ The benchmark harness needs Python 3.11 or newer and Podman; see [Running the lo
 - **No TLS, SASL or ACLs.** Anyone who can reach the port can read and write every topic, and can create and
   delete topics. The default `--listen 0.0.0.0:9092` binds every interface. When every client runs on the same
   host, use `--listen 127.0.0.1:9092`. Clients in containers may not be able to reach a loopback address.
-- **A crafted request can crash the broker on Linux.** The release of the `kafka-protocol` crate in use (0.18.0)
-  sizes arrays from a length prefix taken from the untrusted request, so a crafted request aborts the
-  process on Linux when the allocation fails. This is reproduced by a unit test in a Linux container; on macOS the
-  connection is closed instead. redcrab rejects frames larger than 100 MiB before reading them, but that check does not cover
-  this case. The issue is fixed upstream but not yet released, and redcrab will move to the fixed release
-  once it is published.
+- **A large crafted request can still crash the broker on Linux.** The 0.18.0 release of the `kafka-protocol`
+  crate sized arrays from a length prefix taken from the untrusted request, so a request of a few bytes aborted
+  the process on Linux. redcrab now pins the crate to an unreleased upstream commit (`37fed76`), which rejects
+  array, string and byte lengths larger than the rest of the request. Tests in a Linux arm64 container check that
+  such a request now only closes its connection. The crate still reserves memory for an array before decoding it,
+  up to 120 bytes per byte of request, so a crafted request of tens of MiB can abort the process on a Linux host
+  whose RAM plus swap is smaller than that reservation: 27 MiB was enough on a host with 2 GiB of RAM and no swap.
+  redcrab rejects frames larger than 100 MiB before reading them, which caps the reservation at about 12 GiB.
+  Other Linux targets and overcommit settings are untested. redcrab will move to a crates.io release once one
+  includes these fixes.
 - **Retries can duplicate data.** A retried idempotent produce can be stored twice, because sequence numbers are
   not checked.
 - **Producer ids are not persisted.** They are seeded from the wall clock at startup, so if the clock steps back

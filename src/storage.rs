@@ -398,18 +398,19 @@ impl Segment {
             .entries
             .last()
             .is_none_or(|entry| u64::from(entry.position) < position);
-        if past_last_entry && self.bytes_since_index >= u64::from(index_interval_bytes) {
-            if let (Ok(relative_offset), Ok(position)) = (
+        if past_last_entry
+            && self.bytes_since_index >= u64::from(index_interval_bytes)
+            && let (Ok(relative_offset), Ok(position)) = (
                 u32::try_from(header.base_offset - self.base_offset),
                 u32::try_from(position),
-            ) {
-                self.entries.push(IndexEntry {
-                    relative_offset,
-                    position,
-                    max_timestamp: self.max_timestamp,
-                });
-                self.bytes_since_index = 0;
-            }
+            )
+        {
+            self.entries.push(IndexEntry {
+                relative_offset,
+                position,
+                max_timestamp: self.max_timestamp,
+            });
+            self.bytes_since_index = 0;
         }
         let size = header.size();
         self.bytes_since_index += size;
@@ -689,7 +690,7 @@ fn load_index(index: &File, log_len: u64) -> io::Result<Vec<IndexEntry>> {
     let mut reader = index;
     reader.read_to_end(&mut bytes)?;
     let mut entries: Vec<IndexEntry> = Vec::with_capacity(bytes.len() / INDEX_ENTRY_LEN);
-    for chunk in bytes.chunks_exact(INDEX_ENTRY_LEN) {
+    for chunk in bytes.as_chunks::<INDEX_ENTRY_LEN>().0 {
         let entry = IndexEntry::decode(chunk);
         let in_order = entries
             .last()

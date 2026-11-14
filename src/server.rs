@@ -174,8 +174,9 @@ fn dispatch(broker: &Arc<Broker>, peer: Option<SocketAddr>, frame: Bytes) -> io:
     let header = decode_request_header_from_buffer(&mut body)
         .map_err(|e| invalid(format!("bad request header: {e}")))?;
     debug!(?api_key, version, correlation_id, client = ?header.client_id, "request");
-    // ponytail: kafka-protocol 0.18 pre-allocates arrays from the untrusted length prefix; on hosts that refuse
-    // overcommit (Linux default) a hostile count aborts the process. Fixed upstream after 0.18 (#200), unreleased.
+    // ponytail: kafka-protocol is pinned to an unreleased commit (#200) that rejects array counts above the bytes
+    // left in the frame, but it still reserves count * element size (up to 120 B) before decoding; on Linux a
+    // crafted frame whose reservation exceeds RAM + swap still aborts the process (27 MiB did on a 2 GiB host).
     let request = RequestKind::decode(api_key, &mut body, version)
         .map_err(|e| invalid(format!("malformed {api_key:?} v{version}: {e}")))?;
     let broker = Arc::clone(broker);

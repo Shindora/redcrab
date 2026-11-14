@@ -2,12 +2,12 @@
 name = "redcrab"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [dependencies]
 bytes = "1.12.1"
 crc32c = "0.6.9"
-kafka-protocol = { version = "0.18.0", default-features = false, features = ["broker", "client", "messages_enums"] }
+kafka-protocol = { git = "https://github.com/tychedelia/kafka-protocol-rs", rev = "37fed766406bcc1f97e677781cce68bfedcf8a96", default-features = false, features = ["broker", "client", "messages_enums"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tracing = "0.1.44"
