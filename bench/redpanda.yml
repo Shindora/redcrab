@@ -10,7 +10,7 @@ x-redpanda: &redpanda
       exec rpk redpanda start --overprovisioned --smp=1 --memory=${REDPANDA_MEMORY:?set by bench.py} --reserve-memory=0M --check=false
       --kafka-addr=PLAINTEXT://0.0.0.0:9092 --advertise-kafka-addr=PLAINTEXT://$${HOSTNAME}:9092
       --rpc-addr=0.0.0.0:33145 --advertise-rpc-addr=$${HOSTNAME}:33145
-      --seeds=bench-1:33145,bench-2:33145,bench-3:33145
+      --seeds=${REDPANDA_SEEDS:?set by bench.py}
 services:
   bench-1: {<<: *redpanda, container_name: bench-1, hostname: bench-1}
   bench-2: {<<: *redpanda, container_name: bench-2, hostname: bench-2}

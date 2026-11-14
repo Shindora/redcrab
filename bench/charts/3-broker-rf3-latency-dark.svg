@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="937" viewBox="0 0 800 937" role="img" font-family="-apple-system, BlinkMacSystemFont, &#x27;Segoe UI&#x27;, Helvetica, Arial, sans-serif">
+<title>Publish latency, p50 to p99: 3 brokers, replication factor 3 (local smoke test, not a benchmark)</title>
+<rect x="0.5" y="0.5" width="799" height="936" rx="6" fill="#1a1a19" stroke="#2c2c2a"/>
+<text x="16" y="30" font-size="15" fill="#f0efec" font-weight="600">Publish latency, p50 to p99: 3 brokers, replication factor 3</text>
+<text x="16" y="50" font-size="12" fill="#c3c2b7">Producer send-to-ack with acks=all at steady state. Left dot p50, right dot p99.</text>
+<circle cx="21" cy="70" r="5.5" fill="#1c5cab" stroke="#1a1a19" stroke-width="2"/>
+<text x="34" y="74" font-size="12" fill="#f0efec">p50</text>
+<circle cx="83.4" cy="70" r="5.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/>
+<text x="96.4" y="74" font-size="12" fill="#f0efec">p99</text>
+<line x1="141.8" x2="151.8" y1="70" y2="70" stroke="#898781" stroke-width="1.5"/><circle cx="141.8" cy="70" r="2.5" fill="#898781"/><circle cx="151.8" cy="70" r="2.5" fill="#898781"/>
+<text x="158.8" y="74" font-size="12" fill="#f0efec">earlier runs, same settings</text>
+<text x="272" y="102" font-size="12" fill="#c3c2b7" font-weight="600">ms, log scale</text>
+<text x="16" y="128" font-size="12.5"><tspan font-weight="600" fill="#f0efec">baseline</tspan><tspan dx="8" fill="#c3c2b7">fixed 10,000 rec/s</tspan></text>
+<text x="28" y="153" font-size="12" fill="#f0efec">kafka</text>
+<text x="28" y="185" font-size="12" fill="#f0efec">kafka-fsync</text>
+<text x="28" y="217" font-size="12" fill="#f0efec">redpanda</text>
+<text x="28" y="249" font-size="12" fill="#f0efec">redcrab</text>
+<text x="16" y="282" font-size="12.5"><tspan font-weight="600" fill="#f0efec">max</tspan><tspan dx="8" fill="#c3c2b7">unthrottled</tspan></text>
+<text x="28" y="307" font-size="12" fill="#f0efec">kafka</text>
+<text x="28" y="333" font-size="12" fill="#f0efec">kafka-fsync</text>
+<text x="28" y="359" font-size="12" fill="#f0efec">redpanda</text>
+<text x="28" y="385" font-size="12" fill="#f0efec">redcrab</text>
+<text x="16" y="418" font-size="12.5"><tspan font-weight="600" fill="#f0efec">small-batch</tspan><tspan dx="8" fill="#c3c2b7">fixed 1,000 rec/s, linger.ms=0, batch.size=16384, 10,000 keys</tspan></text>
+<text x="28" y="443" font-size="12" fill="#f0efec">kafka</text>
+<text x="28" y="469" font-size="12" fill="#f0efec">kafka-fsync</text>
+<text x="28" y="495" font-size="12" fill="#f0efec">redpanda</text>
+<text x="28" y="521" font-size="12" fill="#f0efec">redcrab</text>
+<text x="16" y="554" font-size="12.5"><tspan font-weight="600" fill="#f0efec">backlog</tspan><tspan dx="8" fill="#c3c2b7">drain a backlog while producing 5,000 rec/s</tspan></text>
+<text x="28" y="579" font-size="12" fill="#f0efec">kafka</text>
+<text x="28" y="605" font-size="12" fill="#f0efec">kafka-fsync</text>
+<text x="28" y="631" font-size="12" fill="#f0efec">redpanda</text>
+<text x="28" y="657" font-size="12" fill="#f0efec">redcrab</text>
+<line x1="272" x2="272" y1="136" y2="258" stroke="#2c2c2a"/>
+<line x1="272" x2="272" y1="290" y2="394" stroke="#2c2c2a"/>
+<line x1="272" x2="272" y1="426" y2="530" stroke="#2c2c2a"/>
+<line x1="272" x2="272" y1="562" y2="666" stroke="#2c2c2a"/>
+<text x="272" y="682" font-size="11" fill="#898781" text-anchor="middle">1</text>
+<line x1="386" x2="386" y1="136" y2="258" stroke="#2c2c2a"/>
+<line x1="386" x2="386" y1="290" y2="394" stroke="#2c2c2a"/>
+<line x1="386" x2="386" y1="426" y2="530" stroke="#2c2c2a"/>
+<line x1="386" x2="386" y1="562" y2="666" stroke="#2c2c2a"/>
+<text x="386" y="682" font-size="11" fill="#898781" text-anchor="middle">10</text>
+<line x1="500" x2="500" y1="136" y2="258" stroke="#2c2c2a"/>
+<line x1="500" x2="500" y1="290" y2="394" stroke="#2c2c2a"/>
+<line x1="500" x2="500" y1="426" y2="530" stroke="#2c2c2a"/>
+<line x1="500" x2="500" y1="562" y2="666" stroke="#2c2c2a"/>
+<text x="500" y="682" font-size="11" fill="#898781" text-anchor="middle">100</text>
+<line x1="614" x2="614" y1="136" y2="258" stroke="#2c2c2a"/>
+<line x1="614" x2="614" y1="290" y2="394" stroke="#2c2c2a"/>
+<line x1="614" x2="614" y1="426" y2="530" stroke="#2c2c2a"/>
+<line x1="614" x2="614" y1="562" y2="666" stroke="#2c2c2a"/>
+<text x="614" y="682" font-size="11" fill="#898781" text-anchor="middle">1,000</text>
+<line x1="728" x2="728" y1="136" y2="258" stroke="#2c2c2a"/>
+<line x1="728" x2="728" y1="290" y2="394" stroke="#2c2c2a"/>
+<line x1="728" x2="728" y1="426" y2="530" stroke="#2c2c2a"/>
+<line x1="728" x2="728" y1="562" y2="666" stroke="#2c2c2a"/>
+<text x="728" y="682" font-size="11" fill="#898781" text-anchor="middle">10,000</text>
+<g><title>kafka baseline: p50 7 ms, p99 70 ms; earlier run p50 7 ms, p99 68 ms</title><line x1="368.3" x2="480.9" y1="161" y2="161" stroke="#898781" stroke-width="1.5"/><circle cx="368.3" cy="161" r="2.5" fill="#898781"/><circle cx="480.9" cy="161" r="2.5" fill="#898781"/><line x1="368.3" x2="482.3" y1="149" y2="149" stroke="#1c5cab" stroke-width="2"/><circle cx="368.3" cy="149" r="5.5" fill="#1c5cab" stroke="#1a1a19" stroke-width="2"/><circle cx="482.3" cy="149" r="5.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/><text x="358.3" y="153" font-size="11.5" fill="#f0efec" text-anchor="end">7</text><text x="492.3" y="153" font-size="11.5" fill="#f0efec">70</text></g>
+<g><title>kafka-fsync baseline: p50 17 ms, p99 60 ms; earlier run p50 24 ms, p99 256 ms</title><line x1="429.3" x2="546.5" y1="193" y2="193" stroke="#898781" stroke-width="1.5"/><circle cx="429.3" cy="193" r="2.5" fill="#898781"/><circle cx="546.5" cy="193" r="2.5" fill="#898781"/><line x1="412.3" x2="474.7" y1="181" y2="181" stroke="#1c5cab" stroke-width="2"/><circle cx="412.3" cy="181" r="5.5" fill="#1c5cab" stroke="#1a1a19" stroke-width="2"/><circle cx="474.7" cy="181" r="5.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/><text x="402.3" y="185" font-size="11.5" fill="#f0efec" text-anchor="end">17</text><text x="484.7" y="185" font-size="11.5" fill="#f0efec">60</text></g>
+<g><title>redpanda baseline: p50 3 ms, p99 115 ms; earlier run p50 4 ms, p99 2,244 ms</title><line x1="340.6" x2="654" y1="225" y2="225" stroke="#898781" stroke-width="1.5"/><circle cx="340.6" cy="225" r="2.5" fill="#898781"/><circle cx="654" cy="225" r="2.5" fill="#898781"/><line x1="326.4" x2="506.9" y1="213" y2="213" stroke="#1c5cab" stroke-width="2"/><circle cx="326.4" cy="213" r="5.5" fill="#1c5cab" stroke="#1a1a19" stroke-width="2"/><circle cx="506.9" cy="213" r="5.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/><text x="316.4" y="217" font-size="11.5" fill="#f0efec" text-anchor="end">3</text><text x="516.9" y="217" font-size="11.5" fill="#f0efec">115</text></g>
+<text x="272" y="249" font-size="11.5" fill="#c3c2b7" font-style="italic">no run: needs replication</text>
+<g><title>kafka max: p50 1,209 ms, p99 3,459 ms</title><line x1="623.4" x2="675.4" y1="303" y2="303" stroke="#1c5cab" stroke-width="2"/><circle cx="623.4" cy="303" r="5.5" fill="#1c5cab" stroke="#1a1a19" stroke-width="2"/><circle cx="675.4" cy="303" r="5.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/><text x="613.4" y="307" font-size="11.5" fill="#f0efec" text-anchor="end">1,209</text><text x="685.4" y="307" font-size="11.5" fill="#f0efec">3,459</text></g>
+<g><title>kafka-fsync max: p50 1,390 ms, p99 4,108 ms</title><line x1="630.3" x2="684" y1="329" y2="329" stroke="#1c5cab" stroke-width="2"/><circle cx="630.3" cy="329" r="5.5" fill="#1c5cab" stroke="#1a1a19" stroke-width="2"/><circle cx="684" cy="329" r="5.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/><text x="620.3" y="333" font-size="11.5" fill="#f0efec" text-anchor="end">1,390</text><text x="694" y="333" font-size="11.5" fill="#f0efec">4,108</text></g>
+<g><title>redpanda max: p50 195 ms, p99 697 ms</title><line x1="533.1" x2="596.1" y1="355" y2="355" stroke="#1c5cab" stroke-width="2"/><circle cx="533.1" cy="355" r="5.5" fill="#1c5cab" stroke="#1a1a19" stroke-width="2"/><circle cx="596.1" cy="355" r="5.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/><text x="523.1" y="359" font-size="11.5" fill="#f0efec" text-anchor="end">195</text><text x="606.1" y="359" font-size="11.5" fill="#f0efec">697</text></g>
+<text x="272" y="385" font-size="11.5" fill="#c3c2b7" font-style="italic">no run: needs replication</text>
+<g><title>kafka small-batch: p50 1 ms, p99 29 ms</title><line x1="272" x2="438.7" y1="439" y2="439" stroke="#1c5cab" stroke-width="2"/><circle cx="272" cy="439" r="5.5" fill="#1c5cab" stroke="#1a1a19" stroke-width="2"/><circle cx="438.7" cy="439" r="5.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/><text x="262" y="443" font-size="11.5" fill="#f0efec" text-anchor="end">1</text><text x="448.7" y="443" font-size="11.5" fill="#f0efec">29</text></g>
+<g><title>kafka-fsync small-batch: p50 33 ms, p99 1,277 ms</title><line x1="445.1" x2="626.1" y1="465" y2="465" stroke="#1c5cab" stroke-width="2"/><circle cx="445.1" cy="465" r="5.5" fill="#1c5cab" stroke="#1a1a19" stroke-width="2"/><circle cx="626.1" cy="465" r="5.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/><text x="435.1" y="469" font-size="11.5" fill="#f0efec" text-anchor="end">33</text><text x="636.1" y="469" font-size="11.5" fill="#f0efec">1,277</text></g>
+<g><title>redpanda small-batch: p50 1 ms, p99 12 ms</title><line x1="272" x2="395" y1="491" y2="491" stroke="#1c5cab" stroke-width="2"/><circle cx="272" cy="491" r="5.5" fill="#1c5cab" stroke="#1a1a19" stroke-width="2"/><circle cx="395" cy="491" r="5.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/><text x="262" y="495" font-size="11.5" fill="#f0efec" text-anchor="end">1</text><text x="405" y="495" font-size="11.5" fill="#f0efec">12</text></g>
+<text x="272" y="521" font-size="11.5" fill="#c3c2b7" font-style="italic">no run: needs replication</text>
+<g><title>kafka backlog: p50 2 ms, p99 45 ms</title><line x1="306.3" x2="460.5" y1="575" y2="575" stroke="#1c5cab" stroke-width="2"/><circle cx="306.3" cy="575" r="5.5" fill="#1c5cab" stroke="#1a1a19" stroke-width="2"/><circle cx="460.5" cy="575" r="5.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/><text x="296.3" y="579" font-size="11.5" fill="#f0efec" text-anchor="end">2</text><text x="470.5" y="579" font-size="11.5" fill="#f0efec">45</text></g>
+<g><title>kafka-fsync backlog: p50 10 ms, p99 88 ms</title><line x1="386" x2="493.7" y1="601" y2="601" stroke="#1c5cab" stroke-width="2"/><circle cx="386" cy="601" r="5.5" fill="#1c5cab" stroke="#1a1a19" stroke-width="2"/><circle cx="493.7" cy="601" r="5.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/><text x="376" y="605" font-size="11.5" fill="#f0efec" text-anchor="end">10</text><text x="503.7" y="605" font-size="11.5" fill="#f0efec">88</text></g>
+<g><title>redpanda backlog: p50 3 ms, p99 14 ms</title><line x1="326.4" x2="402.7" y1="627" y2="627" stroke="#1c5cab" stroke-width="2"/><circle cx="326.4" cy="627" r="5.5" fill="#1c5cab" stroke="#1a1a19" stroke-width="2"/><circle cx="402.7" cy="627" r="5.5" fill="#3987e5" stroke="#1a1a19" stroke-width="2"/><text x="316.4" y="631" font-size="11.5" fill="#f0efec" text-anchor="end">3</text><text x="412.7" y="631" font-size="11.5" fill="#f0efec">14</text></g>
+<text x="272" y="657" font-size="11.5" fill="#c3c2b7" font-style="italic">no run: needs replication</text>
+<line x1="16" x2="784" y1="698" y2="698" stroke="#2c2c2a"/>
+<text x="16" y="718" font-size="11" fill="#f0efec" font-weight="600">LOCAL smoke numbers from a small Podman VM with memory-capped brokers; not a real benchmark. Publishable results</text>
+<text x="16" y="733" font-size="11" fill="#f0efec" font-weight="600">will come from OpenMessaging Benchmark on dedicated Linux hosts with NVMe drives.</text>
+<text x="16" y="752" font-size="11" fill="#c3c2b7">Hardware (from the result files): a Podman VM with 4 CPUs and 1941 MiB of memory, kernel 7.2.7-200.fc44.aarch64,</text>
+<text x="16" y="767" font-size="11" fill="#c3c2b7">Podman 6.1.4. It ran the load clients and every system shown, each as 3 brokers, replication factor 3</text>
+<text x="16" y="782" font-size="11" fill="#c3c2b7">(min.insync.replicas 2, acks=all), with each broker container capped at 384m.</text>
+<text x="16" y="801" font-size="11" fill="#c3c2b7">Broker settings (from the result files): kafka and kafka-fsync: heap -Xms128m -Xmx128m; redpanda: --smp=1</text>
+<text x="16" y="816" font-size="11" fill="#c3c2b7">--memory=256M. Containers have no CPU limit.</text>
+<text x="16" y="835" font-size="11" fill="#c3c2b7">No run for redcrab: no replication yet. It runs only as 1 broker, replication factor 1, and the 1-broker charts</text>
+<text x="16" y="850" font-size="11" fill="#c3c2b7">compare it.</text>
+<text x="16" y="869" font-size="11" fill="#c3c2b7">Each row has 1 to 2 runs of 30-60 s with the same settings: the colored marks and values show the latest run and the</text>
+<text x="16" y="884" font-size="11" fill="#c3c2b7">thin gray marks under them the earlier runs. Results vary widely between runs (for example, redpanda baseline p99</text>
+<text x="16" y="899" font-size="11" fill="#c3c2b7">was 2,244 and 115 ms in 2 runs). Latency percentiles have 1 ms resolution.</text>
+<text x="16" y="918" font-size="11" fill="#c3c2b7">Runs from 2026-11-14. Full table: python3 bench/bench.py compare (with --all for every run).</text>
+</svg>
