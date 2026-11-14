@@ -230,7 +230,34 @@ The benchmark against Apache Kafka and Redpanda is treated as the project's most
 was built before the broker. Its goal is to produce numbers that anyone can reproduce, comparing the systems under
 the same durability guarantees.
 
-**Results: pending.** No benchmark results have been published yet.
+No benchmark results have been published yet. The charts below come from the local harness.
+
+> [!WARNING]
+> These charts show a local smoke test, not a benchmark, and they are not a fair comparison.
+>
+> - Kafka, Kafka with `flush.messages=1` and Redpanda ran as 3-broker clusters with replication factor 3, inside a
+>   4-CPU Podman VM with about 2 GiB of memory on a laptop, with each broker container capped at 384 MiB.
+> - redcrab ran as one node with replication factor 1, because it has no replication yet. It ran natively on the
+>   macOS host, outside the VM, with no memory cap. It does less work per record, on different resources, so its
+>   hatched bars and hollow dots cannot be compared with the other three.
+> - Each value is a single run of 30 to 60 seconds. Results vary a lot from run to run, and latency percentiles
+>   have 1 ms resolution.
+>
+> Publishable results will come from [OpenMessaging Benchmark](#openmessaging-benchmark) runs on dedicated Linux
+> hosts with NVMe drives. Each chart repeats these caveats in its caption.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="bench/charts/latency-dark.svg">
+  <img alt="Publish latency, p50 to p99, per workload for kafka, kafka-fsync, redpanda and redcrab on a log scale. Local smoke test; redcrab is marked as not comparable." src="bench/charts/latency-light.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="bench/charts/throughput-dark.svg">
+  <img alt="Producer and consumer throughput in MB/s per workload for kafka, kafka-fsync, redpanda and redcrab. Local smoke test; redcrab is marked as not comparable." src="bench/charts/throughput-light.svg">
+</picture>
+
+The harness writes the numbers behind the charts to `bench/results/`, which is not committed. `python3 bench/bench.py compare` prints them as a table, and
+`python3 bench/bench.py chart` redraws the charts.
 
 ### Fairness rules
 
@@ -283,6 +310,7 @@ You need Python 3.11 or newer, Podman with a working `podman compose`, and both 
 ```sh
 python3 bench/bench.py run <target> <workload> [--seconds 60] [--partitions 100]
 python3 bench/bench.py compare
+python3 bench/bench.py chart
 ```
 
 - Targets: `kafka`, `kafka-fsync` (Kafka with `flush.messages=1`), `redpanda` and `redcrab`.
@@ -301,8 +329,10 @@ For `kafka`, `kafka-fsync` and `redpanda`, a run does the following:
 4. Tears the cluster down along with its volumes.
 5. Writes `bench/results/<utc-timestamp>-<target>-<workload>.json`.
 
-`compare` prints one table with the latest result for each target and workload. A `max` run can write tens of
-gigabytes inside the Podman VM.
+`compare` prints one table with the latest result for each target and workload. `chart` draws the same results
+as SVG charts in `bench/charts/`, one light and one dark file per chart, with the caveats from the result files in
+each caption. It marks a run as not comparable when its replication factor is not 3 or its broker had no memory
+cap. A `max` run can write tens of gigabytes inside the Podman VM.
 
 The harness does not start redcrab, so you start it yourself where the client containers can reach it. Use a
 fresh data directory for each run, because the harness creates the topic `bench` and does not delete it:
@@ -586,6 +616,7 @@ The benchmark harness needs Python 3.11 or newer and Podman; see [Running the lo
 | `bench/bench.py` | Local benchmark harness. |
 | `bench/kafka.yml`, `bench/redpanda.yml` | Compose files for the 3-broker clusters used by the harness. |
 | `bench/auth.json` | Empty registry credentials file that the harness points Podman at. |
+| `bench/charts/` | Comparison charts drawn by `bench.py chart`, in light and dark versions. |
 | `bench/omb/` | OpenMessaging Benchmark driver and workload files. |
 
 ## Security and known issues

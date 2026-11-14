@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="926" viewBox="0 0 800 926" role="img" font-family="-apple-system, BlinkMacSystemFont, &#x27;Segoe UI&#x27;, Helvetica, Arial, sans-serif">
+<title>Throughput, MB/s (local smoke test, not a benchmark)</title>
+<defs><pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" fill="#1a1a19"/><line x1="3" y1="0" x2="3" y2="6" stroke="#898781" stroke-width="2"/></pattern></defs>
+<rect x="0.5" y="0.5" width="799" height="925" rx="6" fill="#1a1a19" stroke="#2c2c2a"/>
+<text x="16" y="30" font-size="15" fill="#f0efec" font-weight="600">Throughput, MB/s</text>
+<text x="16" y="50" font-size="12" fill="#c3c2b7">Producer send rate and consumer fetch rate (excluding group join). Fixed-rate workloads cap the producer.</text>
+<path d="M16 63H24A4 4 0 0 1 28 67V73A4 4 0 0 1 24 77H16Z" fill="#3987e5"/>
+<text x="34" y="74" font-size="12" fill="#f0efec">RF 3 cluster</text>
+<path d="M139.6 63H147.6A4 4 0 0 1 151.6 67V73A4 4 0 0 1 147.6 77H139.6Z" fill="url(#hatch)" stroke="#898781" stroke-width="1"/>
+<text x="157.6" y="74" font-size="12" fill="#f0efec">not comparable, see notes</text>
+<text x="236" y="102" font-size="12" fill="#c3c2b7" font-weight="600">Producer MB/s</text>
+<text x="522" y="102" font-size="12" fill="#c3c2b7" font-weight="600">Consumer MB/s</text>
+<text x="16" y="128" font-size="12.5"><tspan font-weight="600" fill="#f0efec">baseline</tspan><tspan dx="8" fill="#c3c2b7">fixed 10,000 rec/s</tspan></text>
+<text x="28" y="153" font-size="12" fill="#f0efec">kafka</text>
+<text x="28" y="179" font-size="12" fill="#f0efec">kafka-fsync</text>
+<text x="28" y="205" font-size="12" fill="#f0efec">redpanda</text>
+<text x="28" y="231" font-size="12" fill="#f0efec">redcrab</text>
+<text x="28" y="245" font-size="11" fill="#c3c2b7" font-style="italic">RF 1, not comparable</text>
+<text x="16" y="278" font-size="12.5"><tspan font-weight="600" fill="#f0efec">max</tspan><tspan dx="8" fill="#c3c2b7">unthrottled</tspan></text>
+<text x="28" y="303" font-size="12" fill="#f0efec">kafka</text>
+<text x="28" y="329" font-size="12" fill="#f0efec">kafka-fsync</text>
+<text x="28" y="355" font-size="12" fill="#f0efec">redpanda</text>
+<text x="28" y="381" font-size="12" fill="#f0efec">redcrab</text>
+<text x="28" y="395" font-size="11" fill="#c3c2b7" font-style="italic">RF 1, not comparable</text>
+<text x="16" y="428" font-size="12.5"><tspan font-weight="600" fill="#f0efec">small-batch</tspan><tspan dx="8" fill="#c3c2b7">fixed 1,000 rec/s, linger.ms=0, batch.size=16384, 10,000 keys</tspan></text>
+<text x="28" y="453" font-size="12" fill="#f0efec">kafka</text>
+<text x="28" y="479" font-size="12" fill="#f0efec">kafka-fsync</text>
+<text x="28" y="505" font-size="12" fill="#f0efec">redpanda</text>
+<text x="28" y="531" font-size="12" fill="#f0efec">redcrab</text>
+<text x="28" y="545" font-size="11" fill="#c3c2b7" font-style="italic">RF 1, not comparable</text>
+<text x="16" y="578" font-size="12.5"><tspan font-weight="600" fill="#f0efec">backlog</tspan><tspan dx="8" fill="#c3c2b7">drain a backlog while producing 5,000 rec/s</tspan></text>
+<text x="28" y="603" font-size="12" fill="#f0efec">kafka</text>
+<text x="28" y="629" font-size="12" fill="#f0efec">kafka-fsync</text>
+<text x="28" y="655" font-size="12" fill="#f0efec">redpanda</text>
+<text x="28" y="681" font-size="12" fill="#f0efec">redcrab</text>
+<text x="28" y="695" font-size="11" fill="#c3c2b7" font-style="italic">RF 1, not comparable</text>
+<line x1="236" x2="236" y1="136" y2="254" stroke="#383835"/>
+<line x1="236" x2="236" y1="286" y2="404" stroke="#383835"/>
+<line x1="236" x2="236" y1="436" y2="554" stroke="#383835"/>
+<line x1="236" x2="236" y1="586" y2="704" stroke="#383835"/>
+<text x="236" y="720" font-size="11" fill="#898781" text-anchor="middle">0</text>
+<line x1="306" x2="306" y1="136" y2="254" stroke="#2c2c2a"/>
+<line x1="306" x2="306" y1="286" y2="404" stroke="#2c2c2a"/>
+<line x1="306" x2="306" y1="436" y2="554" stroke="#2c2c2a"/>
+<line x1="306" x2="306" y1="586" y2="704" stroke="#2c2c2a"/>
+<text x="306" y="720" font-size="11" fill="#898781" text-anchor="middle">50</text>
+<line x1="376" x2="376" y1="136" y2="254" stroke="#2c2c2a"/>
+<line x1="376" x2="376" y1="286" y2="404" stroke="#2c2c2a"/>
+<line x1="376" x2="376" y1="436" y2="554" stroke="#2c2c2a"/>
+<line x1="376" x2="376" y1="586" y2="704" stroke="#2c2c2a"/>
+<text x="376" y="720" font-size="11" fill="#898781" text-anchor="middle">100</text>
+<line x1="446" x2="446" y1="136" y2="254" stroke="#2c2c2a"/>
+<line x1="446" x2="446" y1="286" y2="404" stroke="#2c2c2a"/>
+<line x1="446" x2="446" y1="436" y2="554" stroke="#2c2c2a"/>
+<line x1="446" x2="446" y1="586" y2="704" stroke="#2c2c2a"/>
+<text x="446" y="720" font-size="11" fill="#898781" text-anchor="middle">150</text>
+<g><title>kafka baseline: producer 9.8 MB/s</title><path d="M236 142H245.7A4 4 0 0 1 249.7 146V152A4 4 0 0 1 245.7 156H236Z" fill="#3987e5"/><text x="255.7" y="153" font-size="11.5" fill="#f0efec">9.8</text></g>
+<g><title>kafka-fsync baseline: producer 9.8 MB/s</title><path d="M236 168H245.7A4 4 0 0 1 249.7 172V178A4 4 0 0 1 245.7 182H236Z" fill="#3987e5"/><text x="255.7" y="179" font-size="11.5" fill="#f0efec">9.8</text></g>
+<g><title>redpanda baseline: producer 9.8 MB/s</title><path d="M236 194H245.7A4 4 0 0 1 249.7 198V204A4 4 0 0 1 245.7 208H236Z" fill="#3987e5"/><text x="255.7" y="205" font-size="11.5" fill="#f0efec">9.8</text></g>
+<g><title>redcrab baseline: producer 9.8 MB/s</title><path d="M236 220H245.7A4 4 0 0 1 249.7 224V230A4 4 0 0 1 245.7 234H236Z" fill="url(#hatch)" stroke="#898781" stroke-width="1"/><text x="255.7" y="231" font-size="11.5" fill="#f0efec">9.8</text></g>
+<g><title>kafka max: producer 21.8 MB/s</title><path d="M236 292H262.5A4 4 0 0 1 266.5 296V302A4 4 0 0 1 262.5 306H236Z" fill="#3987e5"/><text x="272.5" y="303" font-size="11.5" fill="#f0efec">21.8</text></g>
+<g><title>kafka-fsync max: producer 18.8 MB/s</title><path d="M236 318H258.2A4 4 0 0 1 262.2 322V328A4 4 0 0 1 258.2 332H236Z" fill="#3987e5"/><text x="268.2" y="329" font-size="11.5" fill="#f0efec">18.8</text></g>
+<g><title>redpanda max: producer 132.5 MB/s</title><path d="M236 344H417.5A4 4 0 0 1 421.5 348V354A4 4 0 0 1 417.5 358H236Z" fill="#3987e5"/><text x="427.5" y="355" font-size="11.5" fill="#f0efec">132.5</text></g>
+<g><title>redcrab max: producer 51.2 MB/s</title><path d="M236 370H303.7A4 4 0 0 1 307.7 374V380A4 4 0 0 1 303.7 384H236Z" fill="url(#hatch)" stroke="#898781" stroke-width="1"/><text x="313.7" y="381" font-size="11.5" fill="#f0efec">51.2</text></g>
+<g><title>kafka small-batch: producer 1.0 MB/s</title><path d="M236 442H236A1.4 1.4 0 0 1 237.4 443.4V454.6A1.4 1.4 0 0 1 236 456H236Z" fill="#3987e5"/><text x="243.4" y="453" font-size="11.5" fill="#f0efec">1.0</text></g>
+<g><title>kafka-fsync small-batch: producer 1.0 MB/s</title><path d="M236 468H236A1.4 1.4 0 0 1 237.4 469.4V480.6A1.4 1.4 0 0 1 236 482H236Z" fill="#3987e5"/><text x="243.4" y="479" font-size="11.5" fill="#f0efec">1.0</text></g>
+<g><title>redpanda small-batch: producer 1.0 MB/s</title><path d="M236 494H236A1.4 1.4 0 0 1 237.4 495.4V506.6A1.4 1.4 0 0 1 236 508H236Z" fill="#3987e5"/><text x="243.4" y="505" font-size="11.5" fill="#f0efec">1.0</text></g>
+<g><title>redcrab small-batch: producer 1.0 MB/s</title><path d="M236 520H236A1.4 1.4 0 0 1 237.4 521.4V532.6A1.4 1.4 0 0 1 236 534H236Z" fill="url(#hatch)" stroke="#898781" stroke-width="1"/><text x="243.4" y="531" font-size="11.5" fill="#f0efec">1.0</text></g>
+<g><title>kafka backlog: producer 4.9 MB/s</title><path d="M236 592H238.8A4 4 0 0 1 242.8 596V602A4 4 0 0 1 238.8 606H236Z" fill="#3987e5"/><text x="248.8" y="603" font-size="11.5" fill="#f0efec">4.9</text></g>
+<g><title>kafka-fsync backlog: producer 4.9 MB/s</title><path d="M236 618H238.8A4 4 0 0 1 242.8 622V628A4 4 0 0 1 238.8 632H236Z" fill="#3987e5"/><text x="248.8" y="629" font-size="11.5" fill="#f0efec">4.9</text></g>
+<g><title>redpanda backlog: producer 4.9 MB/s</title><path d="M236 644H238.8A4 4 0 0 1 242.8 648V654A4 4 0 0 1 238.8 658H236Z" fill="#3987e5"/><text x="248.8" y="655" font-size="11.5" fill="#f0efec">4.9</text></g>
+<g><title>redcrab backlog: producer 4.9 MB/s</title><path d="M236 670H238.8A4 4 0 0 1 242.8 674V680A4 4 0 0 1 238.8 684H236Z" fill="url(#hatch)" stroke="#898781" stroke-width="1"/><text x="248.8" y="681" font-size="11.5" fill="#f0efec">4.9</text></g>
+<line x1="522" x2="522" y1="136" y2="254" stroke="#383835"/>
+<line x1="522" x2="522" y1="286" y2="404" stroke="#383835"/>
+<line x1="522" x2="522" y1="436" y2="554" stroke="#383835"/>
+<line x1="522" x2="522" y1="586" y2="704" stroke="#383835"/>
+<text x="522" y="720" font-size="11" fill="#898781" text-anchor="middle">0</text>
+<line x1="592" x2="592" y1="136" y2="254" stroke="#2c2c2a"/>
+<line x1="592" x2="592" y1="286" y2="404" stroke="#2c2c2a"/>
+<line x1="592" x2="592" y1="436" y2="554" stroke="#2c2c2a"/>
+<line x1="592" x2="592" y1="586" y2="704" stroke="#2c2c2a"/>
+<text x="592" y="720" font-size="11" fill="#898781" text-anchor="middle">200</text>
+<line x1="662" x2="662" y1="136" y2="254" stroke="#2c2c2a"/>
+<line x1="662" x2="662" y1="286" y2="404" stroke="#2c2c2a"/>
+<line x1="662" x2="662" y1="436" y2="554" stroke="#2c2c2a"/>
+<line x1="662" x2="662" y1="586" y2="704" stroke="#2c2c2a"/>
+<text x="662" y="720" font-size="11" fill="#898781" text-anchor="middle">400</text>
+<line x1="732" x2="732" y1="136" y2="254" stroke="#2c2c2a"/>
+<line x1="732" x2="732" y1="286" y2="404" stroke="#2c2c2a"/>
+<line x1="732" x2="732" y1="436" y2="554" stroke="#2c2c2a"/>
+<line x1="732" x2="732" y1="586" y2="704" stroke="#2c2c2a"/>
+<text x="732" y="720" font-size="11" fill="#898781" text-anchor="middle">600</text>
+<g><title>kafka baseline: consumer 334.0 MB/s</title><path d="M522 142H634.9A4 4 0 0 1 638.9 146V152A4 4 0 0 1 634.9 156H522Z" fill="#3987e5"/><text x="644.9" y="153" font-size="11.5" fill="#f0efec">334.0</text></g>
+<g><title>kafka-fsync baseline: consumer 331.9 MB/s</title><path d="M522 168H634.1A4 4 0 0 1 638.1 172V178A4 4 0 0 1 634.1 182H522Z" fill="#3987e5"/><text x="644.1" y="179" font-size="11.5" fill="#f0efec">331.9</text></g>
+<g><title>redpanda baseline: consumer 406.8 MB/s</title><path d="M522 194H660.4A4 4 0 0 1 664.4 198V204A4 4 0 0 1 660.4 208H522Z" fill="#3987e5"/><text x="670.4" y="205" font-size="11.5" fill="#f0efec">406.8</text></g>
+<g><title>redcrab baseline: consumer 89.6 MB/s</title><path d="M522 220H549.3A4 4 0 0 1 553.3 224V230A4 4 0 0 1 549.3 234H522Z" fill="url(#hatch)" stroke="#898781" stroke-width="1"/><text x="559.3" y="231" font-size="11.5" fill="#f0efec">89.6</text></g>
+<g><title>kafka max: consumer 342.9 MB/s</title><path d="M522 292H638A4 4 0 0 1 642 296V302A4 4 0 0 1 638 306H522Z" fill="#3987e5"/><text x="648" y="303" font-size="11.5" fill="#f0efec">342.9</text></g>
+<g><title>kafka-fsync max: consumer 350.2 MB/s</title><path d="M522 318H640.6A4 4 0 0 1 644.6 322V328A4 4 0 0 1 640.6 332H522Z" fill="#3987e5"/><text x="650.6" y="329" font-size="11.5" fill="#f0efec">350.2</text></g>
+<g><title>redpanda max: consumer 541.3 MB/s</title><path d="M522 344H707.5A4 4 0 0 1 711.5 348V354A4 4 0 0 1 707.5 358H522Z" fill="#3987e5"/><text x="717.5" y="355" font-size="11.5" fill="#f0efec">541.3</text></g>
+<g><title>redcrab max: consumer 85.3 MB/s</title><path d="M522 370H547.9A4 4 0 0 1 551.9 374V380A4 4 0 0 1 547.9 384H522Z" fill="url(#hatch)" stroke="#898781" stroke-width="1"/><text x="557.9" y="381" font-size="11.5" fill="#f0efec">85.3</text></g>
+<g><title>kafka small-batch: consumer 214.8 MB/s</title><path d="M522 442H593.2A4 4 0 0 1 597.2 446V452A4 4 0 0 1 593.2 456H522Z" fill="#3987e5"/><text x="603.2" y="453" font-size="11.5" fill="#f0efec">214.8</text></g>
+<g><title>kafka-fsync small-batch: consumer 234.1 MB/s</title><path d="M522 468H599.9A4 4 0 0 1 603.9 472V478A4 4 0 0 1 599.9 482H522Z" fill="#3987e5"/><text x="609.9" y="479" font-size="11.5" fill="#f0efec">234.1</text></g>
+<g><title>redpanda small-batch: consumer 310.8 MB/s</title><path d="M522 494H626.8A4 4 0 0 1 630.8 498V504A4 4 0 0 1 626.8 508H522Z" fill="#3987e5"/><text x="636.8" y="505" font-size="11.5" fill="#f0efec">310.8</text></g>
+<g><title>redcrab small-batch: consumer 98.9 MB/s</title><path d="M522 520H552.6A4 4 0 0 1 556.6 524V530A4 4 0 0 1 552.6 534H522Z" fill="url(#hatch)" stroke="#898781" stroke-width="1"/><text x="562.6" y="531" font-size="11.5" fill="#f0efec">98.9</text></g>
+<g><title>kafka backlog: consumer 290.1 MB/s</title><path d="M522 592H619.5A4 4 0 0 1 623.5 596V602A4 4 0 0 1 619.5 606H522Z" fill="#3987e5"/><text x="629.5" y="603" font-size="11.5" fill="#f0efec">290.1</text></g>
+<g><title>kafka-fsync backlog: consumer 307.0 MB/s</title><path d="M522 618H625.4A4 4 0 0 1 629.4 622V628A4 4 0 0 1 625.4 632H522Z" fill="#3987e5"/><text x="635.4" y="629" font-size="11.5" fill="#f0efec">307.0</text></g>
+<g><title>redpanda backlog: consumer 484.4 MB/s</title><path d="M522 644H687.6A4 4 0 0 1 691.6 648V654A4 4 0 0 1 687.6 658H522Z" fill="#3987e5"/><text x="697.6" y="655" font-size="11.5" fill="#f0efec">484.4</text></g>
+<g><title>redcrab backlog: consumer 73.8 MB/s</title><path d="M522 670H543.8A4 4 0 0 1 547.8 674V680A4 4 0 0 1 543.8 684H522Z" fill="url(#hatch)" stroke="#898781" stroke-width="1"/><text x="553.8" y="681" font-size="11.5" fill="#f0efec">73.8</text></g>
+<line x1="16" x2="784" y1="736" y2="736" stroke="#2c2c2a"/>
+<text x="16" y="756" font-size="11" fill="#f0efec" font-weight="600">LOCAL smoke numbers from a small Podman VM with memory-capped brokers; not a real benchmark. Publishable results</text>
+<text x="16" y="771" font-size="11" fill="#f0efec" font-weight="600">will come from OpenMessaging Benchmark on dedicated Linux hosts with NVMe drives.</text>
+<text x="16" y="790" font-size="11" fill="#c3c2b7">Hardware (from the result files): a Podman VM with 4 CPUs and 1941 MiB of memory, kernel 7.2.7-200.fc44.aarch64,</text>
+<text x="16" y="805" font-size="11" fill="#c3c2b7">Podman 6.1.4. It ran the load clients and the solid marks&#x27; 3-broker clusters with replication factor (RF) 3, each</text>
+<text x="16" y="820" font-size="11" fill="#c3c2b7">broker capped at 384m.</text>
+<text x="16" y="839" font-size="11" fill="#c3c2b7">Hatched or hollow marks (redcrab): RF 1, no memory cap, broker on the host, outside the VM; they do not do the same</text>
+<text x="16" y="854" font-size="11" fill="#c3c2b7">work on the same resources as the solid marks, so they are not comparable.</text>
+<text x="16" y="873" font-size="11" fill="#c3c2b7">Each mark is a single run of 30-60 s. Results vary widely between runs (for example, redpanda baseline p99 was 8, 24</text>
+<text x="16" y="888" font-size="11" fill="#c3c2b7">and 2,244 ms in 3 runs). Latency percentiles have 1 ms resolution.</text>
+<text x="16" y="907" font-size="11" fill="#c3c2b7">Latest run per target and workload, from 2026-11-14. Full table: python3 bench/bench.py compare.</text>
+</svg>

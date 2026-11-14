@@ -7,24 +7,30 @@ Usage (podman with the pinned images already pulled):
         workloads: baseline, max, small-batch, backlog
     python3 bench/bench.py run redcrab baseline --bootstrap host.containers.internal:19092 [--replication-factor 1]
     python3 bench/bench.py compare
+    python3 bench/bench.py chart
 
 A run starts a 3-broker cluster (nothing for redcrab), waits for it, creates the topic, drives load with Kafka's own
 perf tools from a client container (same pinned Kafka image and client settings for every target), tears the cluster
-down with its volumes and writes bench/results/<utc>-<target>-<workload>.json. These are LOCAL numbers from a small
-Podman VM with memory-capped brokers; the real 100-partition runs belong to the OpenMessaging Benchmark files in omb/.
+down with its volumes (then fstrims the VM disk) and writes bench/results/<utc>-<target>-<workload>.json. These are LOCAL
+numbers from a small Podman VM with memory-capped brokers; real-hardware runs use the OpenMessaging Benchmark files in omb/.
+compare prints the latest result per target and workload; chart draws the same set as light and dark SVGs in bench/charts/.
 """
 
 from __future__ import annotations
 
 import argparse
+import html
 import json
+import math
 import os
 import re
 import shlex
 import subprocess
 import sys
+import textwrap
 import time
-from dataclasses import asdict, dataclass
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -63,6 +69,43 @@ PROBE_SECONDS = 15
 WARMUP_SECONDS = 60
 TOPIC_CONFIG_KEYS = ("min.insync.replicas", "flush.messages", "flush.ms", "write.caching")
 NOTE = "LOCAL smoke numbers from a small Podman VM with memory-capped brokers; not a real benchmark"
+
+CHARTS_DIR = BENCH_DIR / "charts"
+CHART_WIDTH = 800
+CHART_FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+LABEL_COLUMN = 236
+BODY_TOP = 112
+HEADING_HEIGHT = 24
+ROW_HEIGHT = 26
+CAVEAT_HEIGHT = 14
+GROUP_GAP = 8
+CAPTION_CHARS = 116
+THEMES = {
+    "light": {
+        "surface": "#fcfcfb",
+        "frame": "#e1e0d9",
+        "ink": "#0b0b0b",
+        "ink2": "#52514e",
+        "muted": "#898781",
+        "grid": "#e1e0d9",
+        "axis": "#c3c2b7",
+        "bar": "#2a78d6",
+        "p50": "#6da7ec",
+        "p99": "#2a78d6",
+    },
+    "dark": {
+        "surface": "#1a1a19",
+        "frame": "#2c2c2a",
+        "ink": "#f0efec",
+        "ink2": "#c3c2b7",
+        "muted": "#898781",
+        "grid": "#2c2c2a",
+        "axis": "#383835",
+        "bar": "#3987e5",
+        "p50": "#1c5cab",
+        "p99": "#3987e5",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -410,14 +453,24 @@ def fmt(value: object, digits: int = 0) -> str:
     return f"{value:,.{digits}f}" if isinstance(value, int | float) else str(value)
 
 
-def compare() -> None:
-    """Print one table with the latest result per target and workload."""
+def load_results() -> list[dict]:
+    """Read every result file, in file name order."""
+    return [json.loads(path.read_text()) for path in sorted(RESULTS_DIR.glob("*.json"))]
+
+
+def latest_results(results: list[dict]) -> dict[tuple[str, str], dict]:
+    """Keep the latest result per target and workload."""
     latest: dict[tuple[str, str], dict] = {}
-    for path in RESULTS_DIR.glob("*.json"):
-        result = json.loads(path.read_text())
+    for result in results:
         key = (result["target"], result["workload"]["name"])
         if key not in latest or result["timestamp"] > latest[key]["timestamp"]:
             latest[key] = result
+    return latest
+
+
+def compare() -> None:
+    """Print one table with the latest result per target and workload."""
+    latest = latest_results(load_results())
     if not latest:
         log(f"no results in {RESULTS_DIR}")
         return
@@ -449,6 +502,333 @@ def compare() -> None:
     log("produce. Consumer rates exclude group-join time. * = consumer stopped before reading every requested record.")
 
 
+def not_comparable(result: dict) -> list[str]:
+    """List how a run departs from the setup of the harness-managed clusters; empty when it matches."""
+    reasons = []
+    rf = result["workload"]["replication_factor"]
+    if rf != REPLICATION_FACTOR:
+        reasons.append(f"RF {rf}")
+    if result["host"]["broker_container_mem_limit"] is None:
+        reasons.append("no memory cap")
+    if result["bootstrap"].startswith("host.containers.internal:"):
+        reasons.append("broker on the host, outside the VM")
+    elif result["image"] == "unmanaged":
+        reasons.append("broker not started by the harness")
+    return reasons
+
+
+def describe_workload(name: str) -> str:
+    """Summarise a workload's producer shape for its chart heading."""
+    workload = WORKLOADS.get(name)
+    if workload is None:
+        return ""
+    if workload.backlog_rate:
+        return f"drain a backlog while producing {workload.rate:,} rec/s"
+    parts = ["unthrottled" if workload.rate < 0 else f"fixed {workload.rate:,} rec/s"]
+    parts += [prop for prop in workload.producer_props if prop not in PRODUCER_PROPS]
+    if workload.key_range:
+        parts.append(f"{workload.key_range:,} keys")
+    return ", ".join(parts)
+
+
+def spread_example(results: list[dict]) -> str:
+    """Quote the target and workload whose p99 varied most between runs, as evidence that single runs are noisy."""
+    runs: dict[tuple[str, str], list[float]] = {}
+    for result in sorted(results, key=lambda r: r["timestamp"]):
+        runs.setdefault((result["target"], result["workload"]["name"]), []).append(result["producer"]["latency_ms"]["p99"])
+    repeated = sorted(key for key, p99s in runs.items() if len(p99s) > 1)
+    if not repeated:
+        return ""
+    key = max(repeated, key=lambda k: max(runs[k]) / max(min(runs[k]), 1))
+    values = [f"{p99:,.0f}" for p99 in runs[key]]
+    return f" (for example, {key[0]} {key[1]} p99 was {', '.join(values[:-1])} and {values[-1]} ms in {len(values)} runs)"
+
+
+def chart_notes(results: list[dict], latest: dict[tuple[str, str], dict]) -> list[str]:
+    """Caption paragraphs that travel with the image: what the numbers are, where they ran and which marks not to compare."""
+    runs = [latest[key] for key in sorted(latest)]
+    managed = [r for r in runs if not not_comparable(r)]
+    others = [r for r in runs if not_comparable(r)]
+    note = " ".join(sorted({f"{r['note']}." for r in runs}))
+    notes = [f"{note} Publishable results will come from OpenMessaging Benchmark on dedicated Linux hosts with NVMe drives."]
+    hosts = sorted({(h["vm_cpus"], h["vm_mem_mib"], h["vm_kernel"], h["podman"]) for h in (r["host"] for r in runs)})
+    vms = "; ".join(f"{cpus} CPUs and {mem} MiB of memory, kernel {kernel}, Podman {podman}" for cpus, mem, kernel, podman in hosts)
+    clusters = ""
+    if managed:
+        brokers = "/".join(sorted({str(len(r.get("broker_mem_after_load") or {})) for r in managed} - {"0"}))
+        rfs = "/".join(sorted({str(r["workload"]["replication_factor"]) for r in managed}))
+        caps = "/".join(sorted({str(r["host"]["broker_container_mem_limit"]) for r in managed}))
+        size = f"{brokers}-broker " if brokers else ""
+        clusters = f" and the solid marks' {size}clusters with replication factor (RF) {rfs}, each broker capped at {caps}"
+    notes.append(f"Hardware (from the result files): a Podman VM with {vms}. It ran the load clients{clusters}.")
+    if others:
+        names = ", ".join(sorted({r["target"] for r in others}))
+        reasons = ", ".join(dict.fromkeys(reason for r in others for reason in not_comparable(r)))
+        caveat = "they do not do the same work on the same resources as the solid marks, so they are not comparable"
+        notes.append(f"Hatched or hollow marks ({names}): {reasons}; {caveat}.")
+    seconds = sorted({r["workload"]["seconds"] for r in runs})
+    span = f"{seconds[0]}-{seconds[-1]}" if len(seconds) > 1 else f"{seconds[0]}"
+    spread = spread_example(results)
+    resolution = "Latency percentiles have 1 ms resolution."
+    notes.append(f"Each mark is a single run of {span} s. Results vary widely between runs{spread}. {resolution}")
+    days = sorted({r["timestamp"][:10] for r in runs})
+    when = days[0] if len(days) == 1 else f"{days[0]} to {days[-1]}"
+    notes.append(f"Latest run per target and workload, from {when}. Full table: python3 bench/bench.py compare.")
+    return notes
+
+
+def esc(value: object) -> str:
+    """Escape text for SVG character data and attribute values."""
+    return html.escape(str(value), quote=True)
+
+
+def num(value: float) -> str:
+    """Format a coordinate deterministically with at most one decimal."""
+    return f"{round(value, 1):g}"
+
+
+def element(name: str, body: str = "", **attrs: object) -> str:
+    """Render one SVG element; attribute names use _ for -, None values are dropped, and body must be escaped already."""
+    rendered = "".join(
+        f' {key.replace("_", "-")}="{num(value) if isinstance(value, float) else esc(value)}"'
+        for key, value in attrs.items()
+        if value is not None
+    )
+    return f"<{name}{rendered}>{body}</{name}>" if body else f"<{name}{rendered}/>"
+
+
+@dataclass
+class Canvas:
+    """The SVG elements of one chart in one colour theme."""
+
+    theme: dict[str, str]
+    parts: list[str] = field(default_factory=list)
+
+    def add(self, name: str, body: str = "", **attrs: object) -> None:
+        """Append an element."""
+        self.parts.append(element(name, body, **attrs))
+
+    def text(self, x: float, y: float, content: str, *, size: float = 12, ink: str = "ink", **attrs: object) -> None:
+        """Append one line of text in one of the theme's text colours."""
+        self.add("text", esc(content), x=float(x), y=float(y), font_size=size, fill=self.theme[ink], **attrs)
+
+
+@dataclass(frozen=True)
+class Slot:
+    """One target's row inside one workload group; y is the vertical centre of its marks."""
+
+    target: str
+    workload: str
+    result: dict | None
+    y: float
+
+
+def dot(theme: dict[str, str], x: float, y: float, fill: str) -> str:
+    """A 9 px marker with a 2 px surface ring; fill "hollow" draws the open marker of a run that is not comparable."""
+    if fill == "hollow":
+        return element("circle", cx=x, cy=y, r=4.5, fill=theme["surface"], stroke=theme["muted"], stroke_width=2)
+    return element("circle", cx=x, cy=y, r=5.5, fill=theme[fill], stroke=theme["surface"], stroke_width=2)
+
+
+def bar(theme: dict[str, str], x: float, y: float, width: float, *, comparable: bool) -> str:
+    """A 14 px horizontal bar, square at the baseline with a 4 px rounded data end; hatched and outlined when not comparable."""
+    top, height, r = y - 7, 14.0, min(4.0, width)
+    end, bottom = x + width, y + 7
+    d = f"M{num(x)} {num(top)}H{num(end - r)}A{num(r)} {num(r)} 0 0 1 {num(end)} {num(top + r)}V{num(top + height - r)}"
+    d += f"A{num(r)} {num(r)} 0 0 1 {num(end - r)} {num(bottom)}H{num(x)}Z"
+    if comparable:
+        return element("path", d=d, fill=theme["bar"])
+    return element("path", d=d, fill="url(#hatch)", stroke=theme["muted"], stroke_width=1)
+
+
+def chart_header(canvas: Canvas, title: str, subtitle: str, legend: list[tuple[str, str]], columns: list[tuple[float, str]]) -> None:
+    """Draw the title, subtitle, a one-row legend and the column headings above the plot."""
+    canvas.text(16, 30, title, size=15, font_weight=600)
+    canvas.text(16, 50, subtitle, ink="ink2")
+    x = 16.0
+    for swatch, label in legend:
+        mark = (
+            bar(canvas.theme, x, 70, 12, comparable=swatch == "bar") if swatch in {"bar", "hatch"} else dot(canvas.theme, x + 5, 70, swatch)
+        )
+        canvas.parts.append(mark)
+        canvas.text(x + 18, 74, label)
+        x += 18 + len(label) * 6.8 + 24
+    for column_x, heading in columns:
+        canvas.text(column_x, 102, heading, ink="ink2", font_weight=600)
+
+
+def chart_rows(canvas: Canvas, latest: dict[tuple[str, str], dict]) -> tuple[list[Slot], list[tuple[float, float]]]:
+    """Draw workload headings and target labels; return the row slots and the vertical span of each group's rows."""
+    targets = [*TARGETS, *sorted({target for target, _ in latest} - set(TARGETS))]
+    workloads = [*WORKLOADS, *sorted({workload for _, workload in latest} - set(WORKLOADS))]
+    slots: list[Slot] = []
+    spans: list[tuple[float, float]] = []
+    y = float(BODY_TOP)
+    for workload in workloads:
+        name = element("tspan", esc(workload), font_weight=600, fill=canvas.theme["ink"])
+        detail = element("tspan", esc(describe_workload(workload)), dx=8, fill=canvas.theme["ink2"])
+        canvas.add("text", name + detail, x=16, y=y + 16, font_size=12.5)
+        y += HEADING_HEIGHT
+        start = y
+        for target in targets:
+            result = latest.get((target, workload))
+            reasons = not_comparable(result) if result else []
+            canvas.text(28, y + 17, target)
+            if reasons:
+                canvas.text(28, y + 31, f"{reasons[0]}, not comparable", size=11, ink="ink2", font_style="italic")
+            slots.append(Slot(target, workload, result, y + 13))
+            y += ROW_HEIGHT + (CAVEAT_HEIGHT if reasons else 0)
+        spans.append((start, y))
+        y += GROUP_GAP
+    return slots, spans
+
+
+def no_run(theme: dict[str, str], x: float, y: float) -> str:
+    """Mark a target without a result for a workload, so a missing run never reads as zero."""
+    return element("text", "no run", x=x, y=y + 4, font_size=11.5, fill=theme["ink2"], font_style="italic")
+
+
+def ms_label(ms: float) -> str:
+    """Format a latency percentile, which the perf tool reports in whole milliseconds."""
+    return "<1" if ms < 1 else f"{ms:,.0f}"
+
+
+def latency_row(theme: dict[str, str], slot: Slot, x: Callable[[float], float]) -> str:
+    """The p50 to p99 range of one run: connector, two markers, both values and a tooltip."""
+    if slot.result is None:
+        return no_run(theme, x(1), slot.y)
+    latency = slot.result["producer"]["latency_ms"]
+    p50, p99 = latency["p50"], latency["p99"]
+    comparable = not not_comparable(slot.result)
+    x50, x99 = x(p50), x(p99)
+    marks = [
+        element("title", esc(f"{slot.target} {slot.workload}: p50 {p50:,.0f} ms, p99 {p99:,.0f} ms")),
+        element("line", x1=x50, x2=x99, y1=slot.y, y2=slot.y, stroke=theme["p50" if comparable else "muted"], stroke_width=2),
+        dot(theme, x50, slot.y, "p50" if comparable else "hollow"),
+        dot(theme, x99, slot.y, "p99" if comparable else "hollow"),
+        element("text", esc(ms_label(p50)), x=x50 - 10, y=slot.y + 4, font_size=11.5, fill=theme["ink"], text_anchor="end"),
+        element("text", esc(ms_label(p99)), x=x99 + 10, y=slot.y + 4, font_size=11.5, fill=theme["ink"]),
+    ]
+    return element("g", "".join(marks))
+
+
+def latency_chart(latest: dict[tuple[str, str], dict], theme: dict[str, str], notes: list[str]) -> str:
+    """Dot plot of publish latency p50 to p99 per workload and target on a log axis, which values from 1 ms to seconds need."""
+    canvas = Canvas(theme)
+    left, right = LABEL_COLUMN + 36, CHART_WIDTH - 72
+    title = "Publish latency, p50 to p99"
+    subtitle = "Producer send-to-ack with acks=all at steady state. Left dot p50, right dot p99."
+    legend = [("p50", "p50"), ("p99", "p99"), ("hollow", "not comparable, see notes")]
+    chart_header(canvas, title, subtitle, legend, [(left, "ms, log scale")])
+    slots, spans = chart_rows(canvas, latest)
+    values = [s.result["producer"]["latency_ms"][p] for s in slots if s.result for p in ("p50", "p99")]
+    low = 10 ** math.floor(math.log10(max(min(values), 1)))
+    decades = math.ceil(math.log10(max(max(values), low * 10) / low))
+
+    def x(ms: float) -> float:
+        return left + math.log10(max(ms, low) / low) / decades * (right - left)
+
+    for power in range(decades + 1):
+        tick = low * 10**power
+        canvas.parts += [element("line", x1=x(tick), x2=x(tick), y1=top, y2=bottom, stroke=theme["grid"]) for top, bottom in spans]
+        canvas.text(x(tick), spans[-1][1] + 16, f"{tick:,}", size=11, ink="muted", text_anchor="middle")
+    canvas.parts += [latency_row(theme, slot, x) for slot in slots]
+    return chart_document(canvas, spans[-1][1] + 32, title, notes)
+
+
+def tick_step(peak: float) -> float:
+    """Return a 1-2-5 step that splits 0 to peak into at most four intervals."""
+    raw = max(peak, 1e-9) / 4
+    base = 10 ** math.floor(math.log10(raw))
+    return next(base * m for m in (1, 2, 5, 10) if base * m >= raw)
+
+
+def throughput_row(theme: dict[str, str], slot: Slot, x0: float, scale: float, side: str) -> str:
+    """One run's MB/s bar with its value at the tip; * marks a consumer that stopped before reading every record."""
+    if slot.result is None:
+        return no_run(theme, x0 + 6, slot.y)
+    stats = slot.result[side]
+    short = "*" if stats.get("records", 0) < stats.get("requested", 0) else ""
+    label = f"{stats['mb_per_sec']:,.1f}{short}"
+    width = stats["mb_per_sec"] * scale
+    marks = [element("title", esc(f"{slot.target} {slot.workload}: {side} {label} MB/s"))]
+    if width > 0:
+        marks.append(bar(theme, x0, slot.y, width, comparable=not not_comparable(slot.result)))
+    marks.append(element("text", esc(label), x=x0 + width + 6, y=slot.y + 4, font_size=11.5, fill=theme["ink"]))
+    return element("g", "".join(marks))
+
+
+def throughput_side(canvas: Canvas, slots: list[Slot], spans: list[tuple[float, float]], x0: float, length: float, side: str) -> None:
+    """Draw producer or consumer MB/s for every row on one linear axis shared by all workloads."""
+    peak = max(s.result[side]["mb_per_sec"] for s in slots if s.result)
+    step = tick_step(peak)
+    top = step * max(1, math.ceil(peak / step))
+    for i in range(round(top / step) + 1):
+        tick_x = x0 + i * step / top * length
+        stroke = canvas.theme["axis" if i == 0 else "grid"]
+        canvas.parts += [element("line", x1=tick_x, x2=tick_x, y1=a, y2=b, stroke=stroke) for a, b in spans]
+        canvas.text(tick_x, spans[-1][1] + 16, f"{i * step:,g}", size=11, ink="muted", text_anchor="middle")
+    canvas.parts += [throughput_row(canvas.theme, slot, x0, length / top, side) for slot in slots]
+
+
+def throughput_chart(latest: dict[tuple[str, str], dict], theme: dict[str, str], notes: list[str]) -> str:
+    """Horizontal bars of producer and consumer MB/s per workload and target."""
+    canvas = Canvas(theme)
+    gap = 24
+    width = (CHART_WIDTH - 16 - LABEL_COLUMN - gap) / 2
+    sides = [(LABEL_COLUMN + i * (width + gap), side) for i, side in enumerate(("producer", "consumer"))]
+    title = "Throughput, MB/s"
+    subtitle = "Producer send rate and consumer fetch rate (excluding group join). Fixed-rate workloads cap the producer."
+    legend = [("bar", f"RF {REPLICATION_FACTOR} cluster"), ("hatch", "not comparable, see notes")]
+    chart_header(canvas, title, subtitle, legend, [(x0, f"{side.capitalize()} MB/s") for x0, side in sides])
+    slots, spans = chart_rows(canvas, latest)
+    for x0, side in sides:
+        throughput_side(canvas, slots, spans, x0, width - 52, side)
+    if any(r["consumer"]["records"] < r["consumer"]["requested"] for r in latest.values()):
+        notes = [*notes, "* The consumer stopped before reading every requested record."]
+    return chart_document(canvas, spans[-1][1] + 32, title, notes)
+
+
+def chart_document(canvas: Canvas, top: float, title: str, notes: list[str]) -> str:
+    """Add the caption under a hairline and wrap everything in an opaque card, so it reads on any page background."""
+    theme = canvas.theme
+    canvas.add("line", x1=16, x2=CHART_WIDTH - 16, y1=top, y2=top, stroke=theme["grid"])
+    y = top + 20
+    for i, note in enumerate(notes):
+        for line in textwrap.wrap(note, CAPTION_CHARS):
+            canvas.text(16, y, line, size=11, ink="ink" if i == 0 else "ink2", font_weight=600 if i == 0 else None)
+            y += 15
+        y += 4
+    height = math.ceil(y)
+    tile = element("rect", width=6, height=6, fill=theme["surface"])
+    stripe = element("line", x1=3, y1=0, x2=3, y2=6, stroke=theme["muted"], stroke_width=2)
+    hatch = element("pattern", tile + stripe, id="hatch", width=6, height=6, patternUnits="userSpaceOnUse", patternTransform="rotate(45)")
+    parts = [
+        element("title", esc(f"{title} (local smoke test, not a benchmark)")),
+        element("defs", hatch),
+        element("rect", x=0.5, y=0.5, width=CHART_WIDTH - 1, height=height - 1, rx=6, fill=theme["surface"], stroke=theme["frame"]),
+        *canvas.parts,
+    ]
+    attrs = {"width": CHART_WIDTH, "height": height, "viewBox": f"0 0 {CHART_WIDTH} {height}", "role": "img", "font_family": CHART_FONT}
+    return element("svg", "\n" + "\n".join(parts) + "\n", xmlns="http://www.w3.org/2000/svg", **attrs) + "\n"
+
+
+def chart() -> None:
+    """Write light and dark SVG charts of the latest result per target and workload to bench/charts/."""
+    results = load_results()
+    latest = latest_results(results)
+    if not latest:
+        log(f"no results in {RESULTS_DIR}")
+        return
+    notes = chart_notes(results, latest)
+    CHARTS_DIR.mkdir(exist_ok=True)
+    for name, draw in (("latency", latency_chart), ("throughput", throughput_chart)):
+        for mode, theme in THEMES.items():
+            path = CHARTS_DIR / f"{name}-{mode}.svg"
+            path.write_text(draw(latest, theme, notes))
+            log(f"wrote {path.relative_to(BENCH_DIR.parent)}")
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse the command line."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -461,6 +841,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--bootstrap", help="host:port of an already running broker (redcrab only)")
     run.add_argument("--replication-factor", type=int, help=f"topic replication factor (redcrab only, default {REPLICATION_FACTOR})")
     commands.add_parser("compare", help="table of the latest result per target and workload")
+    commands.add_parser("chart", help="light and dark SVG charts of the same results, written to bench/charts/")
     return parser.parse_args(argv)
 
 
@@ -470,6 +851,9 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     if args.command == "compare":
         compare()
+        return 0
+    if args.command == "chart":
+        chart()
         return 0
     target = TARGETS[args.target]
     if target.compose and (args.bootstrap or args.replication_factor):
