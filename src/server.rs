@@ -175,7 +175,7 @@ fn dispatch(broker: &Arc<Broker>, peer: Option<SocketAddr>, frame: Bytes) -> io:
         .map_err(|e| invalid(format!("bad request header: {e}")))?;
     debug!(?api_key, version, correlation_id, client = ?header.client_id, "request");
     // ponytail: kafka-protocol 0.18 pre-allocates arrays from the untrusted length prefix; on hosts that refuse
-    // overcommit (Linux default) a hostile count aborts the process. Needs a remaining-bytes cap upstream.
+    // overcommit (Linux default) a hostile count aborts the process. Fixed upstream after 0.18 (#200), unreleased.
     let request = RequestKind::decode(api_key, &mut body, version)
         .map_err(|e| invalid(format!("malformed {api_key:?} v{version}: {e}")))?;
     let broker = Arc::clone(broker);

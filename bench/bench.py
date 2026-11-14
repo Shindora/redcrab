@@ -296,25 +296,23 @@ def broker_memory() -> dict[str, str]:
 def drive(run: Run) -> dict[str, object]:
     """Run the producer phase(s) and a consumer pass from the start of the topic.
 
-    Fixed-rate phases run WARMUP_SECONDS longer and leave that warm-up out of the summary; max is warmed by the probe and
-    excludes its first sixth.
+    The unthrottled probe warms every cluster first (cold Kafka brokers otherwise need about a minute at 1k msg/s before
+    small-batch latency settles) and sizes the max run. Fixed-rate phases then run WARMUP_SECONDS longer and leave that
+    out of the summary; max excludes its first sixth.
     """
     if run.workload.backlog_rate:
         return drive_backlog(run)
-    phases: dict[str, object] = {}
-    produced = 0
+    calibration = probe(run)
     warmup = run.workload.rate * WARMUP_SECONDS
     records = warmup + run.workload.rate * run.seconds
     if run.workload.rate < 0:
-        phases["probe"] = calibration = probe(run)
-        produced += int(calibration["records"])
         records = int(float(calibration["records_per_sec"]) * run.seconds)
         warmup = records // 6
     stats = parse_producer(sh(producer(run, records, run.workload.rate, warmup)))
-    produced += records
+    produced = int(calibration["records"]) + records
     mem = broker_memory()
     read = parse_consumer(sh(consumer(run, produced)), produced)
-    return {"producer": asdict(stats), "consumer": asdict(read), "broker_mem_after_load": mem, **phases}
+    return {"producer": asdict(stats), "consumer": asdict(read), "broker_mem_after_load": mem, "probe": calibration}
 
 
 def drive_backlog(run: Run) -> dict[str, object]:
