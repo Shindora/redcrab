@@ -1,0 +1,7 @@
+# Built by bench.py around a static musl binary cross-compiled on the host; the build context holds only that binary.
+FROM scratch
+COPY redcrab /redcrab
+VOLUME /data
+EXPOSE 9092
+ENTRYPOINT ["/redcrab"]
+CMD ["--listen", "0.0.0.0:9092", "--data-dir", "/data"]

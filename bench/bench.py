@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Local Kafka-protocol benchmark harness (M0: Apache Kafka and Redpanda; redcrab joins as a third target later).
+"""Local Kafka-protocol benchmark harness for Apache Kafka, Redpanda and redcrab.
 
-Usage (podman with the pinned images already pulled):
+Usage (podman with the pinned images already pulled; redcrab also needs cargo and the <arch>-unknown-linux-musl target):
     python3 bench/bench.py run <target> <workload> [--seconds 60] [--partitions 100]
         targets:   kafka, kafka-fsync (flush.messages=1), redpanda, redcrab
         workloads: baseline, max, small-batch, backlog
@@ -9,35 +9,43 @@ Usage (podman with the pinned images already pulled):
     python3 bench/bench.py compare
     python3 bench/bench.py chart
 
-A run starts a 3-broker cluster (nothing for redcrab), waits for it, creates the topic, drives load with Kafka's own
-perf tools from a client container (same pinned Kafka image and client settings for every target), tears the cluster
-down with its volumes (then fstrims the VM disk) and writes bench/results/<utc>-<target>-<workload>.json. These are LOCAL
-numbers from a small Podman VM with memory-capped brokers; real-hardware runs use the OpenMessaging Benchmark files in omb/.
-compare prints the latest result per target and workload; chart draws the same set as light and dark SVGs in bench/charts/.
+A run starts the target's cluster (3 brokers for Kafka and Redpanda; 1 redcrab broker at replication factor 1, from an
+image built from this checkout), waits for it, creates the topic, drives load with Kafka's own perf tools from a client
+container (same pinned Kafka image and client settings for every target), tears the cluster down with its volumes (then
+fstrims the VM disk) and writes bench/results/<utc>-<target>-<workload>.json. --bootstrap points a redcrab run at a broker
+started elsewhere instead. These are LOCAL numbers from a small Podman VM with memory-capped brokers; real-hardware runs
+use the OpenMessaging Benchmark files in omb/. compare prints the latest result per target and workload; chart draws the
+same set as light and dark SVGs in bench/charts/.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 KAFKA_IMAGE = "docker.io/apache/kafka:4.4.0@sha256:833b867a9585a141da455dc2b57431c65cbccb27f11c91f694444cca9f777e0f"
 REDPANDA_IMAGE = "docker.io/redpandadata/redpanda:v26.2.7@sha256:43545ee03966431f5451e0b3c1e651b39fbe3eb383360220311021f50133b649"
+REDCRAB_IMAGE = "localhost/redcrab-bench:latest"
+RUST_ARCH = {"arm64": "aarch64", "amd64": "x86_64"}
 
 BENCH_DIR = Path(__file__).resolve().parent
+REPO_DIR = BENCH_DIR.parent
 RESULTS_DIR = BENCH_DIR / "results"
 NETWORK = "bench_default"
 CLUSTER_BOOTSTRAP = "bench-1:9092"
@@ -53,6 +61,7 @@ CLIENT_JVM_OPTS = "-XX:+UseSerialGC"
 COMPOSE_ENV = {
     "KAFKA_IMAGE": KAFKA_IMAGE,
     "REDPANDA_IMAGE": REDPANDA_IMAGE,
+    "REDCRAB_IMAGE": REDCRAB_IMAGE,
     "BROKER_MEM_LIMIT": BROKER_MEM_LIMIT,
     "BROKER_HEAP": KAFKA_HEAP,
     "REDPANDA_MEMORY": REDPANDA_MEMORY,
@@ -61,6 +70,7 @@ COMPOSE_ENV = {
 
 RECORD_SIZE = 1024
 PARTITIONS = 100
+BROKERS = 3
 REPLICATION_FACTOR = 3
 MIN_INSYNC_REPLICAS = 2
 PRODUCER_PROPS = ("acks=all", "linger.ms=1", "batch.size=131072")
@@ -69,6 +79,7 @@ PROBE_SECONDS = 15
 WARMUP_SECONDS = 60
 TOPIC_CONFIG_KEYS = ("min.insync.replicas", "flush.messages", "flush.ms", "write.caching")
 NOTE = "LOCAL smoke numbers from a small Podman VM with memory-capped brokers; not a real benchmark"
+UNMANAGED = "unmanaged: runs outside the driver"
 
 CHARTS_DIR = BENCH_DIR / "charts"
 CHART_WIDTH = 800
@@ -116,7 +127,9 @@ class Target:
     compose: str | None
     image: str | None
     flush_messages: str = "9223372036854775807"
-    broker_memory: str = "unmanaged: runs outside the driver"
+    broker_memory: str = UNMANAGED
+    brokers: int = BROKERS
+    replication_factor: int = REPLICATION_FACTOR
 
 
 @dataclass(frozen=True)
@@ -178,7 +191,7 @@ TARGETS = {
         Target("kafka", "kafka.yml", KAFKA_IMAGE, broker_memory=f"heap {KAFKA_HEAP}"),
         Target("kafka-fsync", "kafka.yml", KAFKA_IMAGE, flush_messages="1", broker_memory=f"heap {KAFKA_HEAP}"),
         Target("redpanda", "redpanda.yml", REDPANDA_IMAGE, broker_memory=f"--smp=1 --memory={REDPANDA_MEMORY}"),
-        Target("redcrab", None, None),
+        Target("redcrab", "redcrab.yml", REDCRAB_IMAGE, broker_memory="container cap only", brokers=1, replication_factor=1),
     )
 }
 WORKLOADS = {
@@ -231,6 +244,40 @@ def compose(target: Target, *args: str) -> None:
     """Run podman compose for a managed target with the pinned images and memory caps."""
     env = os.environ | COMPOSE_ENV | {"KAFKA_FLUSH_MESSAGES": target.flush_messages}
     sh(["podman", "compose", "-f", str(BENCH_DIR / str(target.compose)), *args], env, timeout=300)
+
+
+def build_redcrab() -> dict[str, str]:
+    """Cross-compile redcrab as a static Linux binary for the VM's CPU and package it as REDCRAB_IMAGE.
+
+    Linking uses the rust-lld that ships with Rust, so no C toolchain is needed, and nothing is compiled inside the small
+    VM. cargo relinks only when the source changed and Podman reuses its cached layer for an unchanged binary, so this is
+    cheap when nothing is stale.
+
+    Returns:
+        The build identity recorded in the result file.
+    """
+    arch = sh(["podman", "info", "--format", "{{.Host.Arch}}"]).strip()
+    triple = f"{RUST_ARCH.get(arch, arch)}-unknown-linux-musl"
+    env = os.environ | {f"CARGO_TARGET_{triple.upper().replace('-', '_')}_LINKER": "rust-lld"}
+    sh(["cargo", "build", "--release", "--locked", "--target", triple, "--manifest-path", str(REPO_DIR / "Cargo.toml")], env)
+    binary = REPO_DIR / "target" / triple / "release" / "redcrab"
+    with tempfile.TemporaryDirectory() as context:
+        shutil.copy2(binary, context)
+        sh(["podman", "build", "--file", str(BENCH_DIR / "Containerfile"), "--tag", REDCRAB_IMAGE, context])
+    git = ["git", "-C", str(REPO_DIR)]
+    changed = sh([*git, "status", "--porcelain", "--", "src", "Cargo.toml", "Cargo.lock"]).strip()
+    return {
+        "commit": sh([*git, "rev-parse", "HEAD"]).strip() + ("+uncommitted" if changed else ""),
+        "rust_target": triple,
+        "rustc": sh(["rustc", "--version"]).strip(),
+        "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+    }
+
+
+def running_broker() -> dict[str, object]:
+    """Read the image id and container memory limit that bench-1 actually runs with."""
+    image_id, memory = sh(["podman", "container", "inspect", "--format", "{{.Image}} {{.HostConfig.Memory}}", "bench-1"]).split()
+    return {"image_id": image_id, "container_mem_bytes": int(memory)}
 
 
 def client(run: Run, role: str, *args: str) -> list[str]:
@@ -383,6 +430,7 @@ def host_facts(target: Target) -> dict[str, object]:
         "vm_mem_mib": info["host"]["memTotal"] // 2**20,
         "vm_kernel": info["host"]["kernel"],
         "podman": info["version"]["Version"],
+        "brokers": target.brokers if target.compose else None,
         "broker_container_mem_limit": BROKER_MEM_LIMIT if target.compose else None,
         "broker_memory": target.broker_memory,
         "client_heap": CLIENT_HEAP,
@@ -404,13 +452,16 @@ def cleanup(target: Target) -> None:
 
 def run_benchmark(run: Run) -> Path:
     """Start the target, run the workload, tear everything down and write the result file."""
+    build = build_redcrab() if run.target.image == REDCRAB_IMAGE else None
     started = datetime.now(UTC)
     facts = host_facts(run.target)
     durability: dict[str, object] = {"producer_acks": "all"}
+    broker: dict[str, object] = {"image_id": None, "container_mem_bytes": None}
     try:
         if run.target.compose:
             cleanup(run.target)
             compose(run.target, "up", "--detach")
+            broker = running_broker()
         wait_ready(run)
         if run.target.name == "redpanda":
             durability["write_caching_default"] = redpanda_write_caching()
@@ -435,11 +486,13 @@ def run_benchmark(run: Run) -> Path:
         "timestamp": started.isoformat(timespec="seconds"),
         "target": run.target.name,
         "image": run.target.image or "unmanaged",
+        "image_id": broker["image_id"],
+        **({"build": build} if build else {}),
         "client_image": KAFKA_IMAGE,
         "bootstrap": run.bootstrap,
         "workload": workload,
         "durability": durability,
-        "host": facts,
+        "host": facts | {"broker_container_mem_bytes": broker["container_mem_bytes"]},
         **load,
     }
     RESULTS_DIR.mkdir(exist_ok=True)
@@ -479,8 +532,8 @@ def compare() -> None:
     def order(key: tuple[str, str]) -> tuple[int, ...]:
         return tuple(names.index(k) if k in names else len(names) for k in key)
 
-    header = ("target", "workload", "parts", "sec", "rate/s", "prod rec/s", "prod MB/s", "avg ms", "p50", "p95", "p99", "p99.9", "max ms")
-    header += ("cons rec/s", "cons MB/s", "timestamp")
+    header = ("target", "workload", "brokers/RF", "parts", "sec", "rate/s", "prod rec/s", "prod MB/s", "avg ms", "p50", "p95", "p99")
+    header += ("p99.9", "max ms", "cons rec/s", "cons MB/s", "timestamp")
     rows = [header]
     for key in sorted(latest, key=order):
         r = latest[key]
@@ -488,7 +541,9 @@ def compare() -> None:
         lat = p["latency_ms"]
         rate = "max" if w["rate"] < 0 else fmt(w["rate"])
         short = "*" if c["records"] < c["requested"] else ""
-        row = (r["target"], w["name"], fmt(w["partitions"]), fmt(w["seconds"]), rate, fmt(p["records_per_sec"]), fmt(p["mb_per_sec"], 1))
+        layout = f"{broker_count(r) or '?'}/{w['replication_factor']}"
+        row = (r["target"], w["name"], layout, fmt(w["partitions"]), fmt(w["seconds"]), rate)
+        row += (fmt(p["records_per_sec"]), fmt(p["mb_per_sec"], 1))
         row += tuple(fmt(lat[k]) for k in ("avg", "p50", "p95", "p99", "p99.9", "max"))
         row += (fmt(c["records_per_sec"]) + short, fmt(c["mb_per_sec"], 1), r["timestamp"])
         rows.append(row)
@@ -502,19 +557,38 @@ def compare() -> None:
     log("produce. Consumer rates exclude group-join time. * = consumer stopped before reading every requested record.")
 
 
-def not_comparable(result: dict) -> list[str]:
-    """List how a run departs from the setup of the harness-managed clusters; empty when it matches."""
-    reasons = []
-    rf = result["workload"]["replication_factor"]
-    if rf != REPLICATION_FACTOR:
-        reasons.append(f"RF {rf}")
-    if result["host"]["broker_container_mem_limit"] is None:
-        reasons.append("no memory cap")
+def broker_count(result: dict) -> int | None:
+    """Return the run's broker count, from the result file or else the containers that reported memory; None when unknown."""
+    return result["host"].get("brokers") or len(result.get("broker_mem_after_load") or {}) or None
+
+
+def replication_gap(result: dict) -> str | None:
+    """Describe how the run's broker count or replication factor departs from the reference clusters; None when it matches."""
+    rf, brokers = result["workload"]["replication_factor"], broker_count(result)
+    if rf == REPLICATION_FACTOR and brokers in {None, BROKERS}:
+        return None
+    if brokers is None:
+        return f"RF {rf}"
+    return f"{brokers} broker{'' if brokers == 1 else 's'} at RF {rf}"
+
+
+def environment_gaps(result: dict) -> list[str]:
+    """List how the run's broker environment departs from the harness-managed brokers in the VM."""
+    gaps = []
+    limit = result["host"]["broker_container_mem_limit"]
+    if limit != BROKER_MEM_LIMIT:
+        gaps.append(f"memory cap {limit}" if limit else "no memory cap")
     if result["bootstrap"].startswith("host.containers.internal:"):
-        reasons.append("broker on the host, outside the VM")
+        gaps.append("broker on the host, outside the VM")
     elif result["image"] == "unmanaged":
-        reasons.append("broker not started by the harness")
-    return reasons
+        gaps.append("broker not started by the harness")
+    return gaps
+
+
+def not_comparable(result: dict) -> list[str]:
+    """List how a run departs from the setup of the harness-managed reference clusters; empty when it matches."""
+    gap = replication_gap(result)
+    return [gap, *environment_gaps(result)] if gap else environment_gaps(result)
 
 
 def describe_workload(name: str) -> str:
@@ -532,10 +606,12 @@ def describe_workload(name: str) -> str:
 
 
 def spread_example(results: list[dict]) -> str:
-    """Quote the target and workload whose p99 varied most between runs, as evidence that single runs are noisy."""
-    runs: dict[tuple[str, str], list[float]] = {}
+    """Quote the target and workload whose p99 varied most between runs of one setup, as evidence that single runs are noisy."""
+    runs: dict[tuple[object, ...], list[float]] = {}
     for result in sorted(results, key=lambda r: r["timestamp"]):
-        runs.setdefault((result["target"], result["workload"]["name"]), []).append(result["producer"]["latency_ms"]["p99"])
+        workload, host = result["workload"], result["host"]
+        setup = (result["bootstrap"], result["image"], host["broker_container_mem_limit"], workload["replication_factor"])
+        runs.setdefault((result["target"], workload["name"], *setup), []).append(result["producer"]["latency_ms"]["p99"])
     repeated = sorted(key for key, p99s in runs.items() if len(p99s) > 1)
     if not repeated:
         return ""
@@ -555,7 +631,7 @@ def chart_notes(results: list[dict], latest: dict[tuple[str, str], dict]) -> lis
     vms = "; ".join(f"{cpus} CPUs and {mem} MiB of memory, kernel {kernel}, Podman {podman}" for cpus, mem, kernel, podman in hosts)
     clusters = ""
     if managed:
-        brokers = "/".join(sorted({str(len(r.get("broker_mem_after_load") or {})) for r in managed} - {"0"}))
+        brokers = "/".join(sorted({str(n) for r in managed if (n := broker_count(r))}))
         rfs = "/".join(sorted({str(r["workload"]["replication_factor"]) for r in managed}))
         caps = "/".join(sorted({str(r["host"]["broker_container_mem_limit"]) for r in managed}))
         size = f"{brokers}-broker " if brokers else ""
@@ -564,8 +640,15 @@ def chart_notes(results: list[dict], latest: dict[tuple[str, str], dict]) -> lis
     if others:
         names = ", ".join(sorted({r["target"] for r in others}))
         reasons = ", ".join(dict.fromkeys(reason for r in others for reason in not_comparable(r)))
-        caveat = "they do not do the same work on the same resources as the solid marks, so they are not comparable"
-        notes.append(f"Hatched or hollow marks ({names}): {reasons}; {caveat}.")
+        caveat = "They do not do the same work on the same resources as the solid marks, so they are not comparable."
+        if not any(environment_gaps(r) for r in others):
+            copies = "/".join(sorted({str(r["workload"]["replication_factor"]) for r in others}))
+            caveat = (
+                f"They ran in the same VM with the same load client and the same {BROKER_MEM_LIMIT} broker memory cap, but they keep "
+                f"{copies} cop{'y' if copies == '1' else 'ies'} of each record instead of {REPLICATION_FACTOR}, so they do less work "
+                "per record and are not comparable."
+            )
+        notes.append(f"Hatched or hollow marks ({names}): {reasons}. {caveat}")
     seconds = sorted({r["workload"]["seconds"] for r in runs})
     span = f"{seconds[0]}-{seconds[-1]}" if len(seconds) > 1 else f"{seconds[0]}"
     spread = spread_example(results)
@@ -779,7 +862,7 @@ def throughput_chart(latest: dict[tuple[str, str], dict], theme: dict[str, str],
     sides = [(LABEL_COLUMN + i * (width + gap), side) for i, side in enumerate(("producer", "consumer"))]
     title = "Throughput, MB/s"
     subtitle = "Producer send rate and consumer fetch rate (excluding group join). Fixed-rate workloads cap the producer."
-    legend = [("bar", f"RF {REPLICATION_FACTOR} cluster"), ("hatch", "not comparable, see notes")]
+    legend = [("bar", f"{BROKERS}-broker RF {REPLICATION_FACTOR} cluster"), ("hatch", "not comparable, see notes")]
     chart_header(canvas, title, subtitle, legend, [(x0, f"{side.capitalize()} MB/s") for x0, side in sides])
     slots, spans = chart_rows(canvas, latest)
     for x0, side in sides:
@@ -838,8 +921,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("workload", choices=WORKLOADS)
     run.add_argument("--seconds", type=int, default=60, help=f"measured seconds per phase (+{WARMUP_SECONDS}s warm-up at a set rate)")
     run.add_argument("--partitions", type=int, default=PARTITIONS, help=f"topic partitions (default {PARTITIONS})")
-    run.add_argument("--bootstrap", help="host:port of an already running broker (redcrab only)")
-    run.add_argument("--replication-factor", type=int, help=f"topic replication factor (redcrab only, default {REPLICATION_FACTOR})")
+    run.add_argument("--bootstrap", help="host:port of a broker started outside the harness (redcrab only)")
+    run.add_argument("--replication-factor", type=int, help="topic replication factor (redcrab only, default 1)")
     commands.add_parser("compare", help="table of the latest result per target and workload")
     commands.add_parser("chart", help="light and dark SVG charts of the same results, written to bench/charts/")
     return parser.parse_args(argv)
@@ -856,16 +939,16 @@ def main(argv: list[str]) -> int:
         chart()
         return 0
     target = TARGETS[args.target]
-    if target.compose and (args.bootstrap or args.replication_factor):
+    if target.name != "redcrab" and (args.bootstrap or args.replication_factor):
         sys.exit("--bootstrap and --replication-factor apply to redcrab only")
-    if not target.compose and not args.bootstrap:
-        sys.exit("redcrab needs --bootstrap host:port (e.g. host.containers.internal:19092)")
+    if args.bootstrap:
+        target = replace(target, compose=None, image=None, broker_memory=UNMANAGED)
     run = Run(
         target=target,
         workload=WORKLOADS[args.workload],
         seconds=args.seconds,
         partitions=args.partitions,
-        replication_factor=args.replication_factor or REPLICATION_FACTOR,
+        replication_factor=args.replication_factor or target.replication_factor,
         bootstrap=args.bootstrap or CLUSTER_BOOTSTRAP,
         network=NETWORK if target.compose else None,
     )

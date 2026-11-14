@@ -12,8 +12,8 @@ and it was built before the broker.
 > **Status: pre-alpha. Single node only. Not for production.**
 > redcrab runs as one node and does not replicate data. There is no redundancy: if the disk or the host is lost,
 > the data is lost. It has no TLS, no authentication and no authorization. A known parsing issue means a crafted
-> request can probably crash it (see [Security and known issues](#security-and-known-issues)). Do not put
-> production data on it, and do not expose it to untrusted networks. It has been tested on macOS only so far.
+> request can crash it on Linux (see [Security and known issues](#security-and-known-issues)). Do not put
+> production data on it, and do not expose it to untrusted networks. It has been tested on macOS and, in the benchmark harness, in a Linux arm64 container.
 
 ## Contents
 
@@ -70,7 +70,7 @@ and it was built before the broker.
 | TLS, SASL, ACLs, quotas | Not implemented. Any client that can connect has full access. |
 | Metrics | None. The only output is the log. |
 | Tiered storage, schema registry, HTTP proxy | Not implemented. |
-| Platforms | Tested on macOS only. Linux is the target platform but has not been verified. Windows is not supported, because the storage layer uses Unix file APIs. |
+| Platforms | Tested on macOS and, in the benchmark harness and the test suite, in a Linux arm64 container. Linux is the target platform; it has not been run on dedicated Linux hosts or on x86-64. Windows is not supported, because the storage layer uses Unix file APIs. |
 
 ## Quickstart
 
@@ -237,9 +237,10 @@ No benchmark results have been published yet. The charts below come from the loc
 >
 > - Kafka, Kafka with `flush.messages=1` and Redpanda ran as 3-broker clusters with replication factor 3, inside a
 >   4-CPU Podman VM with about 2 GiB of memory on a laptop, with each broker container capped at 384 MiB.
-> - redcrab ran as one node with replication factor 1, because it has no replication yet. It ran natively on the
->   macOS host, outside the VM, with no memory cap. It does less work per record, on different resources, so its
->   hatched bars and hollow dots cannot be compared with the other three.
+> - redcrab ran as one node with replication factor 1, because it has no replication yet. It ran in the same VM,
+>   driven by the same client containers, with the same 384 MiB container cap. It keeps one copy of each record
+>   where the others keep three, so it does less work per record, and its hatched bars and hollow dots cannot be
+>   compared with the other three.
 > - Each value is a single run of 30 to 60 seconds. Results vary a lot from run to run, and latency percentiles
 >   have 1 ms resolution.
 >
@@ -264,7 +265,9 @@ The harness writes the numbers behind the charts to `bench/results/`, which is n
 - **Same client, same settings.** Every system is driven by the same Kafka client: the perf tools from one pinned
   `apache/kafka:4.4.0` image in the local harness, and the same Kafka driver in OpenMessaging Benchmark. Producer
   and consumer settings are identical for every system.
-- **Replication factor 3, `acks=all`, `min.insync.replicas=2`** on every system.
+- **Replication factor 3, `acks=all`, `min.insync.replicas=2`** on every system. redcrab is the exception until it has
+  replication: it runs as one node with replication factor 1 and `min.insync.replicas=1`, and is marked as not
+  comparable for that reason.
 - **Kafka is measured in two modes.** The first is Kafka's default, which does not fsync before acknowledging.
   The second sets `flush.messages=1`, which fsyncs every append before acknowledging. The local harness sets this
   broker-wide as `log.flush.interval.messages=1`, and the OMB driver sets it as a topic config. Redpanda and
@@ -280,7 +283,8 @@ The harness writes the numbers behind the charts to `bench/results/`, which is n
 
 ### Workloads
 
-Every workload uses 1 KiB records, 100 partitions, replication factor 3, `acks=all` and `min.insync.replicas=2`.
+Every workload uses 1 KiB records, 100 partitions, replication factor 3, `acks=all` and `min.insync.replicas=2`
+(replication factor 1 and `min.insync.replicas=1` for redcrab).
 The producer uses `linger.ms=1` and `batch.size=131072`, except in small-batch. The consumer uses
 `fetch.max.bytes=16777216`.
 
@@ -305,7 +309,9 @@ The OMB workload files use 4 producers and 4 consumers, a 5-minute warm-up and a
 ### Running the local harness
 
 You need Python 3.11 or newer, Podman with a working `podman compose`, and both images pinned at the top of
-`bench/bench.py` (`KAFKA_IMAGE` and `REDPANDA_IMAGE`), pulled before you start.
+`bench/bench.py` (`KAFKA_IMAGE` and `REDPANDA_IMAGE`), pulled before you start. The `redcrab` target also needs the
+Rust toolchain from [Build and run](#build-and-run) with the static Linux target for the CPU of your Podman VM:
+`rustup target add aarch64-unknown-linux-musl` on Apple silicon, or `x86_64-unknown-linux-musl` on x86-64.
 
 ```sh
 python3 bench/bench.py run <target> <workload> [--seconds 60] [--partitions 100]
@@ -318,11 +324,11 @@ python3 bench/bench.py chart
 - `--seconds` is the number of measured seconds per phase. `baseline` and `small-batch` also run a 60 s warm-up
   that is left out of the summary, and `max` leaves out the first sixth of its run.
 
-For `kafka`, `kafka-fsync` and `redpanda`, a run does the following:
+A run does the following:
 
 1. Starts a 3-broker cluster from `bench/kafka.yml` (KRaft, with combined broker and controller nodes) or from
-   `bench/redpanda.yml`.
-2. Waits for all three brokers. For Redpanda, it also turns write caching off and reads the value back. Then it
+   `bench/redpanda.yml`. For `redcrab`, it starts one broker from `bench/redcrab.yml` instead (see below).
+2. Waits for the brokers. For Redpanda, it also turns write caching off and reads the value back. Then it
    creates the topic and records its effective configs.
 3. Drives the load with `kafka-producer-perf-test` and `kafka-consumer-perf-test` from throwaway client
    containers.
@@ -331,20 +337,35 @@ For `kafka`, `kafka-fsync` and `redpanda`, a run does the following:
 
 `compare` prints one table with the latest result for each target and workload. `chart` draws the same results
 as SVG charts in `bench/charts/`, one light and one dark file per chart, with the caveats from the result files in
-each caption. It marks a run as not comparable when its replication factor is not 3 or its broker had no memory
-cap. A `max` run can write tens of gigabytes inside the Podman VM.
+each caption. It marks a run as not comparable when it did not use a 3-broker cluster with replication factor 3,
+when its brokers were not capped at 384 MiB, or when the harness did not start the broker. A `max` run can write
+tens of gigabytes inside the Podman VM.
 
-The harness does not start redcrab, so you start it yourself where the client containers can reach it. Use a
-fresh data directory for each run, because the harness creates the topic `bench` and does not delete it:
+For `redcrab`, the harness first builds the broker from this checkout on your machine, not inside the small VM.
+`cargo build --release --target <arch>-unknown-linux-musl` produces a static Linux binary linked against musl, so
+it uses musl's memory allocator. It links with the `rust-lld` that ships with Rust, so no C toolchain is needed.
+`podman build` then packages it with `bench/Containerfile` as the image `localhost/redcrab-bench:latest`. Both
+steps are quick no-ops when nothing changed. The run starts that image as one broker, `bench-1`, on the same
+network as the other clusters, with the same 384 MiB container cap and its data on a volume. It creates the topic
+with replication factor 1 and `min.insync.replicas=1`, and it is driven by the same client containers. The result
+file records the image id, the git commit, the Rust target and the SHA-256 of the binary.
+
+Replication factor 1 is the default for `redcrab` and the only value it accepts today. A redcrab run therefore
+keeps one copy of each record, while the Kafka and Redpanda runs replicate each record to three brokers. That makes
+redcrab runs non-comparable with theirs. Until replication lands, they are useful for development only.
+
+To benchmark a redcrab that you started yourself, pass its address with `--bootstrap` (and, if needed,
+`--replication-factor`). Use a fresh data directory for each run, because the harness creates the topic `bench`
+and does not delete it:
 
 ```sh
 ./target/release/redcrab --listen 0.0.0.0:19092 --advertised-host host.containers.internal --data-dir "$(mktemp -d)"
-python3 bench/bench.py run redcrab baseline --bootstrap host.containers.internal:19092 --replication-factor 1
+python3 bench/bench.py run redcrab baseline --bootstrap host.containers.internal:19092
 ```
 
-`--replication-factor 1` is required today, because redcrab rejects any other value. That makes redcrab runs
-non-comparable with the replication-factor-3 runs of Kafka and Redpanda. Until replication lands, they are useful
-for development only.
+The charts mark such runs as not started by the harness. A broker on the macOS host also runs on different
+resources: there `fsync` uses `F_FULLFSYNC`, which costs much more than `fdatasync` inside the VM, and the clients
+reach it over the slower network path between the VM and the host.
 
 > [!NOTE]
 > Results from the local harness are smoke tests, not benchmark results. The harness runs memory-capped brokers
@@ -615,6 +636,7 @@ The benchmark harness needs Python 3.11 or newer and Podman; see [Running the lo
 | `tests/roundtrip.rs` | End-to-end tests against a broker over TCP. |
 | `bench/bench.py` | Local benchmark harness. |
 | `bench/kafka.yml`, `bench/redpanda.yml` | Compose files for the 3-broker clusters used by the harness. |
+| `bench/redcrab.yml`, `bench/Containerfile` | Compose file for the single redcrab broker, and the image the harness builds around a static Linux binary. |
 | `bench/auth.json` | Empty registry credentials file that the harness points Podman at. |
 | `bench/charts/` | Comparison charts drawn by `bench.py chart`, in light and dark versions. |
 | `bench/omb/` | OpenMessaging Benchmark driver and workload files. |
@@ -627,9 +649,10 @@ The benchmark harness needs Python 3.11 or newer and Podman; see [Running the lo
 - **No TLS, SASL or ACLs.** Anyone who can reach the port can read and write every topic, and can create and
   delete topics. The default `--listen 0.0.0.0:9092` binds every interface. When every client runs on the same
   host, use `--listen 127.0.0.1:9092`. Clients in containers may not be able to reach a loopback address.
-- **A crafted request can probably crash the broker.** The release of the `kafka-protocol` crate in use (0.18.0)
-  sizes arrays from a length prefix taken from the untrusted request, so a crafted request can likely abort the
-  process on Linux. redcrab rejects frames larger than 100 MiB before reading them, but that check does not cover
+- **A crafted request can crash the broker on Linux.** The release of the `kafka-protocol` crate in use (0.18.0)
+  sizes arrays from a length prefix taken from the untrusted request, so a crafted request aborts the
+  process on Linux when the allocation fails. This is reproduced by a unit test in a Linux container; on macOS the
+  connection is closed instead. redcrab rejects frames larger than 100 MiB before reading them, but that check does not cover
   this case. The issue is fixed upstream but not yet released, and redcrab will move to the fixed release
   once it is published.
 - **Retries can duplicate data.** A retried idempotent produce can be stored twice, because sequence numbers are

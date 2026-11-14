@@ -1,0 +1,9 @@
+name: bench
+services:
+  bench-1:
+    image: ${REDCRAB_IMAGE:?set by bench.py}
+    pull_policy: never
+    mem_limit: ${BROKER_MEM_LIMIT:?set by bench.py}
+    container_name: bench-1
+    init: true
+    command: [--listen, 0.0.0.0:9092, --advertised-host, bench-1, --advertised-port, "9092", --data-dir, /data, --node-id, "1"]
