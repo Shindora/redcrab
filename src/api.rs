@@ -1013,7 +1013,8 @@ fn unanswered(broker: &Broker) -> i16 {
         .unwrap_or(ResponseError::UnknownMemberId.code())
 }
 
-/// Answers `JoinGroup` once the group's join phase completes.
+/// Answers `JoinGroup` once the group's join phase completes. The request is dropped before the
+/// wait, which can last a rebalance timeout: decoded, it can be a hundred times its frame.
 pub async fn join_group(
     broker: &Broker,
     version: i16,
@@ -1026,19 +1027,21 @@ pub async fn join_group(
     let reply = broker
         .groups()
         .join(&request, version, client, Instant::now());
+    let member_id = request.member_id.clone();
+    drop(request);
     reply
-        .resolve(|| group::join_error(unanswered(broker), request.member_id, version))
+        .resolve(|| group::join_error(unanswered(broker), member_id, version))
         .await
 }
 
-/// Answers `SyncGroup`; followers wait for the leader's assignment.
-pub async fn sync_group(broker: &Broker, request: &SyncGroupRequest) -> SyncGroupResponse {
+/// Answers `SyncGroup`; followers wait for the leader's assignment, without keeping their request.
+pub async fn sync_group(broker: &Broker, request: SyncGroupRequest) -> SyncGroupResponse {
     if let Err(code) = broker.cluster().coordinator_check() {
         return group::sync_error(code);
     }
-    broker
-        .groups()
-        .sync(request, Instant::now())
+    let reply = broker.groups().sync(&request, Instant::now());
+    drop(request);
+    reply
         .resolve(|| group::sync_error(unanswered(broker)))
         .await
 }

@@ -1,11 +1,18 @@
 use std::collections::HashSet;
-use std::io::IsTerminal;
+use std::future::Future;
+use std::io::{self, IsTerminal};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
 use redcrab::{Broker, BrokerConfig, Peer};
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::{Level, error, info};
+
+/// How long blocking work left after a shutdown may delay the exit.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 const USAGE: &str = "\
 usage: redcrab [--node-id ID] [--listen ADDR] [--data-dir DIR]
@@ -151,13 +158,44 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async move {
+    let served = runtime.block_on(async move {
+        let shutdown = shutdown_signal()?;
+        #[cfg(feature = "failpoints")]
+        let power_failure = signal(SignalKind::user_defined1())?;
         let broker = Broker::start(config, rpc_listener).await?;
+        #[cfg(feature = "failpoints")]
+        power_fail_on(power_failure, &broker);
         info!(%local, advertised = %format!("{}:{}", broker.config.advertised_host, broker.config.advertised_port), "listening");
         let listener = tokio::net::TcpListener::from_std(listener)?;
-        redcrab::serve(listener, broker).await;
+        redcrab::serve(listener, Arc::clone(&broker), shutdown).await;
+        broker.shutdown().await;
+        info!("stopped");
         Ok(())
+    });
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    served
+}
+
+/// Completes on the first SIGTERM or SIGINT.
+fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        let name = tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+        };
+        info!("{name} received; shutting down");
     })
+}
+
+#[cfg(feature = "failpoints")]
+fn power_fail_on(mut power_failure: tokio::signal::unix::Signal, broker: &Arc<Broker>) {
+    let broker = Arc::clone(broker);
+    tokio::spawn(async move {
+        power_failure.recv().await;
+        let _ = tokio::task::spawn_blocking(move || broker.power_fail()).await;
+    });
 }
 
 fn main() -> ExitCode {

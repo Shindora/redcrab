@@ -43,13 +43,16 @@ use crate::replica::{
     ELECTION_TIMEOUT_MAX, ELECTION_TIMEOUT_MIN, Event, GroupKey, HEARTBEAT_INTERVAL,
     MAX_APPEND_BYTES, Replica, Shards, View, open_group,
 };
-use crate::storage::replace_file;
+use crate::storage::{create_dir_durably, replace_file};
 use crate::transport::{Inbound, Inbox, Item, Reader, Transport, WireError, put_str16};
 
 /// Most partitions a topic may have.
 pub const MAX_PARTITIONS: i32 = 10_000;
 /// Largest node id: node ids fill the top bits of producer ids.
 pub const MAX_NODE_ID: NodeId = 32_767;
+/// Exit status of a simulated power failure.
+#[cfg(feature = "failpoints")]
+pub const POWER_FAILURE_EXIT: i32 = 99;
 const DEFAULT_REPLICATION_FACTOR: usize = 3;
 const NODE_FILE: &str = "node";
 const NODE_HEADER: &str = "redcrab node 1";
@@ -309,12 +312,30 @@ impl Cluster {
         Ok(cluster)
     }
 
-    /// Stops the shards and the transport. Replicas still referenced elsewhere stay readable.
+    /// Stops the shards and the transport, then fsyncs every log. Replicas still referenced
+    /// elsewhere stay readable.
     pub(crate) fn shutdown(&self) {
         self.shards.stop();
         if let Some(transport) = &self.transport {
             transport.shutdown();
         }
+        for replica in read(&self.replicas).values() {
+            replica.flush();
+        }
+    }
+
+    /// Simulates a power failure: locks every log for good, so nothing more is written, cuts each
+    /// back to what was fsynced, and exits without flushing anything.
+    #[cfg(feature = "failpoints")]
+    pub(crate) fn power_fail(&self) -> ! {
+        let replicas = write(&self.replicas);
+        let frozen: Vec<_> = replicas.values().map(|r| r.lose_unsynced()).collect();
+        let cut: u64 = frozen.iter().map(|(_, cut)| cut).sum();
+        error!(
+            cut,
+            "simulated power failure: logs cut back to what was fsynced; exiting"
+        );
+        std::process::exit(POWER_FAILURE_EXIT)
     }
 
     /// Waits until the metadata log has a leader and this node has caught up with it, and every
@@ -1089,7 +1110,14 @@ fn prepare_data_dir(dir: &Path, id: NodeId, voters: &[NodeId]) -> Result<(), Sta
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    if dir.exists() && fs::read_dir(dir)?.next().is_some() {
+    let interrupted_claim = format!("{NODE_FILE}.tmp");
+    if dir.exists()
+        && fs::read_dir(dir)?.any(|entry| {
+            entry.map_or(true, |entry| {
+                entry.file_name() != interrupted_claim.as_str()
+            })
+        })
+    {
         return Err(fail(
             "it is not empty but has no redcrab node file, so it was written by a redcrab from \
              before replication or by something else; this version cannot read it, so remove it or \
@@ -1097,7 +1125,7 @@ fn prepare_data_dir(dir: &Path, id: NodeId, voters: &[NodeId]) -> Result<(), Sta
                 .into(),
         ));
     }
-    fs::create_dir_all(dir)?;
+    create_dir_durably(dir)?;
     replace_file(dir, NODE_FILE, identity.as_bytes())?;
     Ok(())
 }
@@ -1485,6 +1513,11 @@ mod tests {
         fs::write(old.join("topics"), "").unwrap();
         let refused = prepare_data_dir(&old, 0, &[0]).unwrap_err().to_string();
         assert!(refused.contains("before replication"), "{refused}");
+        let interrupted = dir.path().join("interrupted");
+        fs::create_dir_all(&interrupted).unwrap();
+        fs::write(interrupted.join("node.tmp"), "redcrab no").unwrap();
+        prepare_data_dir(&interrupted, 0, &[0]).unwrap();
+        prepare_data_dir(&interrupted, 0, &[0]).unwrap();
     }
 
     #[test]

@@ -1,5 +1,7 @@
-//! Three-node clusters of real broker processes on localhost, on ephemeral ports and temporary
-//! data directories, driven through the Kafka protocol. Nodes are stopped with SIGKILL.
+//! Clusters of real broker processes on localhost, on ephemeral ports and temporary data
+//! directories, driven through the Kafka protocol. Nodes are stopped with SIGKILL, which keeps
+//! what they wrote but did not fsync, or with SIGTERM or SIGINT; with the `failpoints` feature,
+//! SIGUSR1 makes a node keep only what it fsynced, as a power failure would.
 //!
 //! The tests share the machine's disk and CPU with each other, so they run one cluster at a time.
 
@@ -9,7 +11,7 @@ use std::future::Future;
 use std::io;
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -41,6 +43,7 @@ use redcrab::storage::batch_frames;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 const NOT_LEADER_OR_FOLLOWER: i16 = 6;
@@ -50,6 +53,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// Generous bound for anything that waits on elections, replication or restarts.
 const SETTLE: Duration = Duration::from_secs(45);
 const POLL: Duration = Duration::from_millis(50);
+const WRITER_SHIFT: u32 = 32;
 
 static ONE_CLUSTER_AT_A_TIME: Mutex<()> = Mutex::new(());
 
@@ -161,6 +165,42 @@ impl Cluster {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+
+    /// Sends `signal`, a name `kill` knows, to node `id` and waits for it to exit, failing the
+    /// test if that takes longer than `within`.
+    fn signal(&mut self, id: i32, signal: &str, within: Duration) -> ExitStatus {
+        let node = self.nodes.iter_mut().find(|n| n.id == id).unwrap();
+        let mut child = node.child.take().expect("the node is running");
+        let sent = Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg(child.id().to_string())
+            .status()
+            .unwrap();
+        assert!(sent.success(), "kill -{signal} node {id}");
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("node {id} did not exit within {within:?} of SIG{signal}");
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// Simulates a power failure of node `id`: only what it fsynced stays on its disk.
+    #[cfg(feature = "failpoints")]
+    fn power_fail(&mut self, id: i32) {
+        let status = self.signal(id, "USR1", Duration::from_secs(10));
+        assert_eq!(
+            status.code(),
+            Some(redcrab::cluster::POWER_FAILURE_EXIT),
+            "node {id} after SIGUSR1"
+        );
     }
 }
 
@@ -410,6 +450,14 @@ async fn current_leader(
         }
     }
     best.map(|(_, leader)| leader)
+}
+
+/// Waits for a leader of partition 0 of `topic` among the nodes in `among`.
+async fn leader_among(cluster: &Cluster, among: &[i32], topic: Uuid) -> i32 {
+    eventually("a leader", SETTLE, || {
+        current_leader(cluster, among, topic, 0)
+    })
+    .await
 }
 
 /// Produces `value` to the current leader until it is acknowledged; returns its offset. A retry
@@ -901,50 +949,142 @@ async fn a_new_leader_answers_latest_offsets_only_once_its_high_watermark_is_cur
     assert_eq!(latest.1, new.epoch);
 }
 
-/// A producer writes sequence numbers one at a time with acks=all, retrying each until it is
-/// acknowledged, while the partition's leader is killed and restarted `rounds` times; afterwards
-/// every acknowledged number must be on the final leader, in order.
+/// Writes sequence numbers to partition 0 of `topic` with acks=all from concurrent writers, each
+/// sending one at a time and retrying it until it is acknowledged, until stopped; yields the
+/// acknowledged numbers in order. Writer `w` numbers its records from `w << WRITER_SHIFT`.
+struct Producer {
+    stop: Arc<AtomicBool>,
+    acknowledged: Arc<Mutex<Vec<u64>>>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl Producer {
+    fn start(cluster: &Cluster, topic: Uuid, writers: u64) -> Producer {
+        let ports: HashMap<i32, u16> = cluster
+            .ids()
+            .iter()
+            .map(|&id| (id, cluster.port(id)))
+            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let acknowledged = Arc::new(Mutex::new(Vec::new()));
+        let tasks = (0..writers)
+            .map(|writer| {
+                tokio::spawn(write(
+                    ports.clone(),
+                    topic,
+                    writer << WRITER_SHIFT,
+                    Arc::clone(&stop),
+                    Arc::clone(&acknowledged),
+                ))
+            })
+            .collect();
+        Producer {
+            stop,
+            acknowledged,
+            tasks,
+        }
+    }
+
+    async fn stop(self) -> Vec<u64> {
+        self.stop.store(true, Ordering::Relaxed);
+        for task in self.tasks {
+            task.await.unwrap();
+        }
+        let acknowledged = self.acknowledged.lock().unwrap().clone();
+        assert!(!acknowledged.is_empty(), "nothing was acknowledged");
+        acknowledged
+    }
+}
+
+/// One writer of a [`Producer`], numbering its records from `sequence`.
+async fn write(
+    ports: HashMap<i32, u16>,
+    topic: Uuid,
+    mut sequence: u64,
+    stop: Arc<AtomicBool>,
+    acknowledged: Arc<Mutex<Vec<u64>>>,
+) {
+    let mut leader: Option<u16> = None;
+    while !stop.load(Ordering::Relaxed) {
+        let Some(port) = leader else {
+            for &port in ports.values() {
+                if let Some(view) = topic_view(port, topic).await
+                    && let Some(&found) = ports.get(&view[0].leader)
+                {
+                    leader = Some(found);
+                    break;
+                }
+            }
+            tokio::time::sleep(POLL).await;
+            continue;
+        };
+        if let Ok((0, _)) = produce(port, topic, 0, batch(&[&sequence.to_string()]), 5_000).await {
+            acknowledged.lock().unwrap().push(sequence);
+            sequence += 1;
+        } else {
+            leader = None;
+            tokio::time::sleep(POLL).await;
+        }
+    }
+}
+
+/// Checks that every acknowledged number is on the leader every node agrees on, each writer's in
+/// the order they were acknowledged, and that every replica stores the leader's committed batches
+/// byte for byte; returns how many numbers the leader stores.
+async fn acknowledged_records_are_kept(
+    cluster: &Cluster,
+    topic: Uuid,
+    acknowledged: &[u64],
+) -> usize {
+    let all = cluster.ids();
+    let leader = agreed_view(cluster, &all, topic, |_| true)
+        .await
+        .remove(0)
+        .leader;
+    let mut lasts = HashMap::new();
+    for &number in acknowledged {
+        lasts.insert(number >> WRITER_SHIFT, number);
+    }
+    let stored: Vec<u64> = eventually("the final leader to serve its log", SETTLE, || async {
+        let read = read_from(cluster.port(leader), topic, 0, 0).await.ok()?;
+        let numbers: Vec<u64> = read.iter().filter_map(|(_, v)| v.parse().ok()).collect();
+        let present: HashSet<u64> = numbers.iter().copied().collect();
+        lasts
+            .values()
+            .all(|last| present.contains(last))
+            .then_some(numbers)
+    })
+    .await;
+    let mut first_position = HashMap::new();
+    for (at, number) in stored.iter().enumerate() {
+        first_position.entry(*number).or_insert(at);
+    }
+    let mut previous = HashMap::new();
+    for number in acknowledged {
+        let position = *first_position
+            .get(number)
+            .unwrap_or_else(|| panic!("acknowledged record {number} was lost"));
+        let writer = number >> WRITER_SHIFT;
+        if let Some(before) = previous.insert(writer, position) {
+            assert!(
+                before < position,
+                "writer {writer}'s acknowledged records are out of order"
+            );
+        }
+    }
+    replicas_converge(cluster, &all, leader, topic, 0).await;
+    stored.len()
+}
+
+/// A producer writes with acks=all while the partition's leader is killed and restarted `rounds`
+/// times; afterwards every acknowledged number must be on the final leader, in order.
 async fn acknowledged_records_survive_leader_kills(rounds: usize) {
     let mut cluster = Cluster::start(3);
     let all = cluster.ids();
     let controller = controller(&cluster, &all).await;
     let topic = create_topic_retrying(cluster.port(controller), "durable", 1, 3).await;
     agreed_view(&cluster, &all, topic, |_| true).await;
-
-    let ports: HashMap<i32, u16> = all.iter().map(|&id| (id, cluster.port(id))).collect();
-    let stop = Arc::new(AtomicBool::new(false));
-    let acknowledged = Arc::new(Mutex::new(Vec::new()));
-    let producing = tokio::spawn({
-        let (stop, acknowledged, ports) =
-            (Arc::clone(&stop), Arc::clone(&acknowledged), ports.clone());
-        async move {
-            let mut sequence = 0_u64;
-            let mut leader: Option<u16> = None;
-            while !stop.load(Ordering::Relaxed) {
-                let Some(port) = leader else {
-                    for &port in ports.values() {
-                        if let Some(view) = topic_view(port, topic).await
-                            && let Some(&found) = ports.get(&view[0].leader)
-                        {
-                            leader = Some(found);
-                            break;
-                        }
-                    }
-                    tokio::time::sleep(POLL).await;
-                    continue;
-                };
-                if let Ok((0, _)) =
-                    produce(port, topic, 0, batch(&[&sequence.to_string()]), 5_000).await
-                {
-                    acknowledged.lock().unwrap().push(sequence);
-                    sequence += 1;
-                } else {
-                    leader = None;
-                    tokio::time::sleep(POLL).await;
-                }
-            }
-        }
-    });
+    let producer = Producer::start(&cluster, topic, 1);
 
     for round in 0..rounds {
         tokio::time::sleep(Duration::from_millis(800)).await;
@@ -959,48 +1099,126 @@ async fn acknowledged_records_survive_leader_kills(rounds: usize) {
         cluster.restart(leader);
     }
     tokio::time::sleep(Duration::from_secs(1)).await;
-    stop.store(true, Ordering::Relaxed);
-    producing.await.unwrap();
-
-    let acknowledged = acknowledged.lock().unwrap().clone();
-    assert!(!acknowledged.is_empty(), "nothing was acknowledged");
-    let leader = agreed_view(&cluster, &all, topic, |_| true)
-        .await
-        .remove(0)
-        .leader;
-    let stored: Vec<u64> = eventually("the final leader to serve its log", SETTLE, || async {
-        let read = read_from(cluster.port(leader), topic, 0, 0).await.ok()?;
-        let last = *acknowledged.last()?;
-        let numbers: Vec<u64> = read.iter().filter_map(|(_, v)| v.parse().ok()).collect();
-        numbers.contains(&last).then_some(numbers)
-    })
-    .await;
-    let mut first_position = HashMap::new();
-    for (at, number) in stored.iter().enumerate() {
-        first_position.entry(*number).or_insert(at);
-    }
-    let positions: Vec<usize> = acknowledged
-        .iter()
-        .map(|number| {
-            *first_position
-                .get(number)
-                .unwrap_or_else(|| panic!("acknowledged record {number} was lost"))
-        })
-        .collect();
-    assert!(
-        positions.windows(2).all(|pair| pair[0] < pair[1]),
-        "acknowledged records are out of order"
-    );
+    let acknowledged = producer.stop().await;
+    let stored = acknowledged_records_are_kept(&cluster, topic, &acknowledged).await;
     eprintln!(
-        "{} records acknowledged across {rounds} leader kills, {} stored",
+        "{} records acknowledged across {rounds} leader kills, {stored} stored",
         acknowledged.len(),
-        stored.len()
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn acknowledged_records_survive_repeated_leader_kills() {
     acknowledged_records_survive_leader_kills(3).await;
+}
+
+/// SIGTERM and SIGINT, the leader's under load, then every node's: each node exits with status 0
+/// within a few seconds, and after a restart the cluster still holds every acknowledged record.
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_and_sigint_stop_nodes_cleanly_and_keep_every_acknowledged_record() {
+    let mut cluster = Cluster::start(3);
+    let all = cluster.ids();
+    let controller = controller(&cluster, &all).await;
+    let topic = create_topic_retrying(cluster.port(controller), "graceful", 1, 3).await;
+    agreed_view(&cluster, &all, topic, |_| true).await;
+    let producer = Producer::start(&cluster, topic, 4);
+    let stop = |cluster: &mut Cluster, id: i32, signal: &str| {
+        let stopped = Instant::now();
+        let status = cluster.signal(id, signal, Duration::from_secs(10));
+        assert_eq!(status.code(), Some(0), "node {id} after SIG{signal}");
+        eprintln!("node {id} exited {:?} after SIG{signal}", stopped.elapsed());
+    };
+    for signal in ["TERM", "INT"] {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let leader = leader_among(&cluster, &all, topic).await;
+        stop(&mut cluster, leader, signal);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cluster.restart(leader);
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let acknowledged = producer.stop().await;
+    for &id in &all {
+        stop(&mut cluster, id, "TERM");
+    }
+    for &id in &all {
+        cluster.restart(id);
+    }
+    let stored = acknowledged_records_are_kept(&cluster, topic, &acknowledged).await;
+    eprintln!(
+        "{} records acknowledged across two leader shutdowns, {stored} stored",
+        acknowledged.len()
+    );
+}
+
+/// Power failures under an acks=all producer: the leader alone, repeatedly; the leader and then
+/// its successor, so that two nodes are down at once; finally all three at once. Each failed node
+/// keeps only what it fsynced, and is restarted. No acknowledged record may be lost, and the
+/// replicas must end up identical.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread")]
+async fn acknowledged_records_survive_power_failures() {
+    let mut cluster = Cluster::start(3);
+    let all = cluster.ids();
+    let controller = controller(&cluster, &all).await;
+    let topic = create_topic_retrying(cluster.port(controller), "power", 1, 3).await;
+    agreed_view(&cluster, &all, topic, |_| true).await;
+    let producer = Producer::start(&cluster, topic, 8);
+
+    for round in 0..4_u64 {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let leader = leader_among(&cluster, &all, topic).await;
+        cluster.power_fail(leader);
+        tokio::time::sleep(Duration::from_millis(300 + 400 * round)).await;
+        cluster.restart(leader);
+    }
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let first = leader_among(&cluster, &all, topic).await;
+    cluster.power_fail(first);
+    let survivors: Vec<i32> = all.iter().copied().filter(|&id| id != first).collect();
+    let second = leader_among(&cluster, &survivors, topic).await;
+    cluster.power_fail(second);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    cluster.restart(first);
+    cluster.restart(second);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    leader_among(&cluster, &all, topic).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    for &id in &all {
+        cluster.power_fail(id);
+    }
+    for &id in &all {
+        cluster.restart(id);
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let acknowledged = producer.stop().await;
+    let stored = acknowledged_records_are_kept(&cluster, topic, &acknowledged).await;
+    eprintln!(
+        "{} records acknowledged across 7 power failures, {stored} stored",
+        acknowledged.len()
+    );
+}
+
+/// A node alone acknowledges once it has fsynced, so a power failure loses nothing acknowledged.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lone_node_keeps_acknowledged_records_through_power_failures() {
+    let mut cluster = Cluster::start(1);
+    let topic = create_topic_retrying(cluster.port(1), "alone", 1, 1).await;
+    let producer = Producer::start(&cluster, topic, 8);
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        cluster.power_fail(1);
+        cluster.restart(1);
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let acknowledged = producer.stop().await;
+    let stored = acknowledged_records_are_kept(&cluster, topic, &acknowledged).await;
+    eprintln!(
+        "{} records acknowledged across 3 power failures, {stored} stored",
+        acknowledged.len()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

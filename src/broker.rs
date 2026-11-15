@@ -98,7 +98,15 @@ impl Broker {
         Ok(broker)
     }
 
-    /// Stops the replicas and the transport; the broker answers nothing useful afterwards.
+    /// Simulates a power failure: every log is cut back to what was fsynced and the process exits
+    /// at once, with status [`crate::cluster::POWER_FAILURE_EXIT`]. Blocking.
+    #[cfg(feature = "failpoints")]
+    pub fn power_fail(&self) -> ! {
+        self.cluster.power_fail()
+    }
+
+    /// Stops the replicas and the transport and fsyncs every log; the broker answers nothing useful
+    /// afterwards.
     pub async fn shutdown(&self) {
         if let Some(watcher) = self
             .watcher

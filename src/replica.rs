@@ -188,6 +188,28 @@ impl Replica {
             .then(|| self.log.blocking_lock().epoch_at(offset))
             .flatten()
     }
+
+    /// Fsyncs everything appended, once the shards have stopped. Blocking.
+    pub(crate) fn flush(&self) {
+        self.log
+            .blocking_lock()
+            .flush()
+            .unwrap_or_else(|e| fatal(format_args!("flushing {:?}: {e}", self.key)));
+    }
+
+    /// Locks the log for good and cuts it back to what was fsynced, returning the bytes cut.
+    /// Blocking.
+    #[cfg(feature = "failpoints")]
+    pub(crate) fn lose_unsynced(&self) -> (tokio::sync::MutexGuard<'_, Log>, u64) {
+        let log = self.log.blocking_lock();
+        let cut = log.lose_unsynced().unwrap_or_else(|e| {
+            fatal(format_args!(
+                "simulating a power failure of {:?}: {e}",
+                self.key
+            ))
+        });
+        (log, cut)
+    }
 }
 
 /// Kafka error code for a storage failure.

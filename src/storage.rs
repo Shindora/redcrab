@@ -706,6 +706,27 @@ impl Log {
     }
 }
 
+#[cfg(feature = "failpoints")]
+impl Log {
+    /// Leaves on disk only what a power failure would: the active segment's log cut back to the
+    /// flushed end, and its index emptied, since an active index is fsynced only when recovery
+    /// trims it. Sealed segments were fsynced whole. Returns how many log bytes were cut.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of a failed read or truncation.
+    // ponytail: one crash state, the harshest for the log; a torn last write, unsynced bytes that did reach the disk, and a lost directory entry are not simulated.
+    pub fn lose_unsynced(&self) -> io::Result<u64> {
+        let active = self.active();
+        let synced = active
+            .locate(self.flushed_end)?
+            .map_or(active.size, |(position, _)| position);
+        active.log.set_len(synced)?;
+        active.index.set_len(0)?;
+        Ok(active.size - synced)
+    }
+}
+
 impl fmt::Debug for Log {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Log")
@@ -1437,7 +1458,7 @@ fn segment_bases(dir: &Path) -> io::Result<Vec<i64>> {
 }
 
 /// Create `dir` and any missing ancestors, syncing each new directory entry into its parent.
-fn create_dir_durably(dir: &Path) -> io::Result<()> {
+pub(crate) fn create_dir_durably(dir: &Path) -> io::Result<()> {
     let missing: Vec<&Path> = dir
         .ancestors()
         .take_while(|path| !path.as_os_str().is_empty() && !path.exists())

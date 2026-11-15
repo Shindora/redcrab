@@ -106,7 +106,11 @@ async fn start(dir: &Path) -> (u16, Server) {
     .await
     .unwrap();
     let listener = TcpListener::from_std(listener).unwrap();
-    let serving = tokio::spawn(redcrab::serve(listener, Arc::clone(&broker)));
+    let serving = tokio::spawn(redcrab::serve(
+        listener,
+        Arc::clone(&broker),
+        std::future::pending(),
+    ));
     (port, Server { broker, serving })
 }
 
@@ -853,6 +857,43 @@ async fn absurd_array_count_closes_connection_and_broker_stays_up() {
         .await
         .call(&ApiVersionsRequest::default(), 3)
         .await;
+    assert_eq!(versions.error_code, 0);
+}
+
+/// Only `Produce` may exceed 1 MiB: a 7 MiB batch is stored and fetched back whole, while a
+/// Metadata request just over 1 MiB closes its connection before its body is read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_produce_is_accepted_but_other_requests_stop_at_1_mib() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, _server) = start(dir.path()).await;
+    let mut client = Client::connect(port).await;
+    let topic_id = create_topic(&mut client, "large", 1).await;
+    let value: String = (0..7 << 20)
+        .map(|at| char::from(b'a' + u8::try_from(at % 26).unwrap()))
+        .collect();
+    let produced = produce_by_id(&mut client, topic_id, 0, batch(&[&value])).await;
+    let partition = &produced.responses[0].partition_responses[0];
+    assert_eq!((partition.error_code, partition.base_offset), (0, 1));
+    let fetch = fetch_by_id(topic_id, 0, 1, 0).with_max_bytes(16 << 20);
+    let fetched = client.call(&fetch, 13).await;
+    assert_eq!(values(&fetched.responses[0].partitions[0]), [(1, value)]);
+
+    let mut frame = BytesMut::new();
+    frame.put_i32(1 << 20 | 1);
+    RequestHeader::default()
+        .with_request_api_key(MetadataRequest::KEY)
+        .with_request_api_version(12)
+        .with_correlation_id(1)
+        .encode(&mut frame, MetadataRequest::header_version(12))
+        .unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream.write_all(&frame).await.unwrap();
+    let mut reply = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut reply))
+        .await
+        .expect("broker must close the connection");
+    assert!(matches!(read, Ok(0) | Err(_)), "got a reply: {reply:?}");
+    let versions = client.call(&ApiVersionsRequest::default(), 3).await;
     assert_eq!(versions.error_code, 0);
 }
 
