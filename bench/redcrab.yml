@@ -1,9 +1,19 @@
 name: bench
+x-redcrab: &redcrab
+  image: ${REDCRAB_IMAGE:?set by bench.py}
+  pull_policy: never
+  mem_limit: ${BROKER_MEM_LIMIT:?set by bench.py}
+  init: true
 services:
   bench-1:
-    image: ${REDCRAB_IMAGE:?set by bench.py}
-    pull_policy: never
-    mem_limit: ${BROKER_MEM_LIMIT:?set by bench.py}
+    <<: *redcrab
     container_name: bench-1
-    init: true
-    command: [--listen, 0.0.0.0:9092, --advertised-host, bench-1, --advertised-port, "9092", --data-dir, /data, --node-id, "1"]
+    command: [--node-id, "1", --listen, 0.0.0.0:9092, --rpc-listen, 0.0.0.0:9093, --data-dir, /data, --peers, "${REDCRAB_PEERS:?set by bench.py}"]
+  bench-2:
+    <<: *redcrab
+    container_name: bench-2
+    command: [--node-id, "2", --listen, 0.0.0.0:9092, --rpc-listen, 0.0.0.0:9093, --data-dir, /data, --peers, "${REDCRAB_PEERS:?set by bench.py}"]
+  bench-3:
+    <<: *redcrab
+    container_name: bench-3
+    command: [--node-id, "3", --listen, 0.0.0.0:9092, --rpc-listen, 0.0.0.0:9093, --data-dir, /data, --peers, "${REDCRAB_PEERS:?set by bench.py}"]

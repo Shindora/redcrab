@@ -8,15 +8,18 @@ Usage (podman with the pinned images already pulled; redcrab also needs cargo an
     python3 bench/bench.py run redcrab baseline --bootstrap host.containers.internal:19092 [--replication-factor 1]
     python3 bench/bench.py compare [--all]
     python3 bench/bench.py chart
+    python3 bench/bench.py verify-failover <target>
 
-A run starts the target's cluster (Kafka and Redpanda as 3 brokers at replication factor 3, or with --brokers 1 as one
-broker at replication factor 1; redcrab is always one broker at replication factor 1, from an image built from this
-checkout), waits for it, creates the topic, drives load with Kafka's own perf tools from a client container (same pinned
-Kafka image and client settings for every target), tears the cluster down with its volumes (then fstrims the VM disk) and
-writes bench/results/<utc>-<target>-<workload>-<brokers>-broker-rf<rf>.json. --bootstrap points a redcrab run at a broker
-started elsewhere instead. These are LOCAL numbers from a small Podman VM with memory-capped brokers; real-hardware runs
-use the OpenMessaging Benchmark files in omb/. compare prints the latest result per target, workload and setup (broker
-count and replication factor), or every result with --all; chart draws light and dark SVGs per setup in bench/charts/.
+A run starts the target's cluster (3 brokers at replication factor 3, or with --brokers 1 one broker at replication
+factor 1; redcrab from an image built from this checkout), waits for it, creates the topic, drives load with Kafka's own
+perf tools from a client container (same pinned Kafka image and client settings for every target), tears the cluster down
+with its volumes (then fstrims the VM disk) and writes bench/results/<utc>-<target>-<workload>-<brokers>-broker-rf<rf>.json.
+A run writes at most 12 GiB counting replicas and the probe; a max run that would write more is cut short and marked capped.
+--bootstrap points a redcrab run at a broker started elsewhere instead. These are LOCAL numbers from a small Podman VM with
+memory-capped brokers; real-hardware runs use the OpenMessaging Benchmark files in omb/. compare prints the latest result
+per target, workload and setup (broker count and replication factor), or every result with --all; chart draws light and
+dark SVGs per setup in bench/charts/. verify-failover starts 3 brokers, kills the leader of a one-partition topic several
+times under an acks=all producer, and checks that every acknowledged record can still be consumed.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import itertools
 import json
 import math
 import os
@@ -34,8 +38,9 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -79,6 +84,9 @@ SETUPS: tuple[Setup, ...] = ((1, 1), (BROKERS, REPLICATION_FACTOR))
 PRODUCER_PROPS = ("acks=all", "linger.ms=1", "batch.size=131072")
 CONSUMER_PROPS = ("fetch.max.bytes=16777216",)
 PROBE_SECONDS = 15
+DISK_MARGIN = 10 * 2**30
+MAX_RUN_BYTES = 12 * 2**30
+PROBE_SHARE = 3
 WARMUP_SECONDS = 60
 TOPIC_CONFIG_KEYS = ("min.insync.replicas", "flush.messages", "flush.ms", "write.caching")
 KAFKA_BROKER_CONFIG_KEYS = (
@@ -91,6 +99,15 @@ KAFKA_BROKER_CONFIG_KEYS = (
     "share.coordinator.state.topic.min.isr",
 )
 CONFIG_RE = re.compile(r"^\s+([\w.]+)=(\S*) sensitive=", re.MULTILINE)
+ALL_BROKERS = ",".join(f"bench-{i}:9092" for i in range(1, BROKERS + 1))
+FAILOVER_KILLS = 3
+FAILOVER_RATE = 1000
+# A killed container's address vanishes, so connecting to it hangs until the client's 10-30 s setup timeout; 1 s keeps that
+# client artefact from dominating the measured failover.
+FAILOVER_PRODUCER_PROPS = ("socket.connection.setup.timeout.ms=1000", "socket.connection.setup.timeout.max.ms=1000")
+FAILOVER_SETTLE_SECONDS = 10
+FAILOVER_TIMEOUT_SECONDS = 60
+ACK_RUN_MS = 2000
 NOTE = "LOCAL smoke numbers from a small Podman VM with memory-capped brokers; not a real benchmark"
 UNMANAGED = "unmanaged: runs outside the driver"
 
@@ -134,14 +151,13 @@ THEMES = {
 
 @dataclass(frozen=True)
 class Target:
-    """A system under test; compose is None when the driver starts nothing, and a target without replication runs one broker."""
+    """A system under test; compose is None when the driver starts nothing."""
 
     name: str
     compose: str | None
     image: str | None
     flush_messages: str = "9223372036854775807"
     broker_memory: str = UNMANAGED
-    replicated: bool = True
 
 
 @dataclass(frozen=True)
@@ -209,7 +225,7 @@ TARGETS = {
         Target("kafka", "kafka.yml", KAFKA_IMAGE, broker_memory=f"heap {KAFKA_HEAP}"),
         Target("kafka-fsync", "kafka.yml", KAFKA_IMAGE, flush_messages="1", broker_memory=f"heap {KAFKA_HEAP}"),
         Target("redpanda", "redpanda.yml", REDPANDA_IMAGE, broker_memory=f"--smp=1 --memory={REDPANDA_MEMORY}"),
-        Target("redcrab", "redcrab.yml", REDCRAB_IMAGE, broker_memory="container cap only", replicated=False),
+        Target("redcrab", "redcrab.yml", REDCRAB_IMAGE, broker_memory="container cap only"),
     )
 }
 WORKLOADS = {
@@ -265,6 +281,7 @@ def compose(run: Run, *args: str) -> None:
         "KAFKA_FLUSH_MESSAGES": run.target.flush_messages,
         "KAFKA_QUORUM_VOTERS": ",".join(f"{i}@bench-{i}:9093" for i in run.nodes),
         "REDPANDA_SEEDS": ",".join(f"bench-{i}:33145" for i in run.nodes),
+        "REDCRAB_PEERS": ",".join(f"{i}@bench-{i}:9093/bench-{i}:9092" for i in run.nodes),
         "REPLICATION_FACTOR": str(run.replication_factor),
         "MIN_INSYNC_REPLICAS": str(run.min_insync),
     }
@@ -398,17 +415,20 @@ def parse_producer(out: str) -> ProducerStats:
     return ProducerStats(int(m[1]), bool(m[2]), float(m[3]), float(m[4]), latency, m[0], intervals)
 
 
-def probe(run: Run) -> dict[str, object]:
-    """Produce unthrottled for PROBE_SECONDS, then stop; the tool prints no summary when stopped, so use its 1 s reports."""
-    proc = spawn(producer(run, 10**10, -1, report_ms=1000))
+def probe(run: Run, limit: int) -> dict[str, object]:
+    """Produce unthrottled for PROBE_SECONDS or up to limit records; the tool prints no summary when stopped, so use its 1 s reports."""
+    proc = spawn(producer(run, limit, -1, report_ms=1000))
     time.sleep(PROBE_SECONDS)
     sh(["podman", "rm", "--force", "--volumes", "--time", "0", "bench-producer"], check=False)
-    reports = [(int(n), float(rate)) for n, rate in INTERVAL_RE.findall(finish(proc, check=False))]
-    if len(reports) < 4:
+    out = finish(proc, check=False)
+    reports = [(int(n), float(rate)) for n, rate in INTERVAL_RE.findall(out)]
+    if len(reports) < 2:
         msg = f"probe produced only {len(reports)} interval reports"
         raise RuntimeError(msg)
     tail = [rate for _, rate in reports[len(reports) // 2 :]]
-    return {"seconds": PROBE_SECONDS, "records": sum(n for n, _ in reports), "records_per_sec": sum(tail) / len(tail)}
+    done = PRODUCER_RE.search(out)
+    records = int(done[1]) if done else sum(n for n, _ in reports)
+    return {"seconds": PROBE_SECONDS, "limit": limit, "records": records, "records_per_sec": sum(tail) / len(tail)}
 
 
 def parse_consumer(out: str, requested: int) -> ConsumerStats:
@@ -428,26 +448,70 @@ def broker_memory() -> dict[str, str]:
     return dict(line.split("=", 1) for line in out.splitlines() if re.match(r"bench-\d=", line))
 
 
+def disk_budget(run: Run) -> int:
+    """Return how many records the host disk can still take, each RECORD_SIZE bytes times the replication factor, keeping DISK_MARGIN free.
+
+    A Podman machine's disk is a sparse file under the home directory that only shrinks when cleanup fstrims it after a
+    run, so a fast replicated cluster can fill the host disk within one max run, and a full host disk crashes the VM.
+    """
+    budget = (shutil.disk_usage(Path.home()).free - DISK_MARGIN) // (RECORD_SIZE * run.replication_factor)
+    if budget <= 0:
+        msg = f"the host disk has less than {DISK_MARGIN // 2**30} GiB free"
+        raise RuntimeError(msg)
+    return budget
+
+
+def record_cap(run: Run) -> int:
+    """Return how many records one run may write in all, probe included: MAX_RUN_BYTES with replication, within the disk budget.
+
+    The ceiling does not depend on how fast the probe finds the target, so a fast replicated cluster cannot plan a run
+    larger than the host disk takes.
+    """
+    return min(MAX_RUN_BYTES // (RECORD_SIZE * run.replication_factor), disk_budget(run))
+
+
+def check_budget(run: Run, records: int, limit: int) -> None:
+    """Refuse to write more records than the run's record cap leaves for this phase."""
+    if records > limit:
+        gib = records * RECORD_SIZE * run.replication_factor / 2**30
+        msg = f"the run would write {records:,} records ({gib:,.0f} GiB with replication) but may write at most {limit:,}"
+        raise RuntimeError(msg)
+
+
 def drive(run: Run) -> dict[str, object]:
     """Run the producer phase(s) and a consumer pass from the start of the topic.
 
     The unthrottled probe warms every cluster first (cold Kafka brokers otherwise need about a minute at 1k msg/s before
     small-batch latency settles) and sizes the max run. Fixed-rate phases then run WARMUP_SECONDS longer and leave that
-    out of the summary; max excludes its first sixth.
+    out of the summary; max excludes its first sixth. The probe may write 1/PROBE_SHARE of the record cap, and a max run
+    whose probe asks for more than the rest is cut to it and marked capped.
     """
     if run.workload.backlog_rate:
         return drive_backlog(run)
-    calibration = probe(run)
-    warmup = run.workload.rate * WARMUP_SECONDS
-    records = warmup + run.workload.rate * run.seconds
+    cap = record_cap(run)
+    probe_limit = cap // PROBE_SHARE
+    calibration = probe(run, probe_limit)
+    room = cap - probe_limit
     if run.workload.rate < 0:
-        records = int(float(calibration["records_per_sec"]) * run.seconds)
+        planned = int(float(calibration["records_per_sec"]) * run.seconds)
+        records = min(planned, room)
         warmup = records // 6
+    else:
+        warmup = run.workload.rate * WARMUP_SECONDS
+        planned = records = warmup + run.workload.rate * run.seconds
+        check_budget(run, records, room)
     stats = parse_producer(sh(producer(run, records, run.workload.rate, warmup)))
     produced = int(calibration["records"]) + records
     mem = broker_memory()
     read = parse_consumer(sh(consumer(run, produced)), produced)
-    return {"producer": asdict(stats), "consumer": asdict(read), "broker_mem_after_load": mem, "probe": calibration}
+    limits = {"max_run_bytes": MAX_RUN_BYTES, "cap_records": cap, "probe_limit": probe_limit, "planned": planned, "records": records}
+    return {
+        "producer": asdict(stats),
+        "consumer": asdict(read),
+        "broker_mem_after_load": mem,
+        "probe": calibration,
+        "record_cap": limits | {"capped": records < planned},
+    }
 
 
 def drive_backlog(run: Run) -> dict[str, object]:
@@ -456,6 +520,7 @@ def drive_backlog(run: Run) -> dict[str, object]:
     The fill warms the cluster, so the live producer has no warm-up exclusion: its summary covers the drain.
     """
     backlog = run.workload.backlog_rate * run.seconds
+    check_budget(run, backlog + run.workload.rate * run.seconds, record_cap(run))
     fill = parse_producer(sh(producer(run, backlog, -1)))
     live = spawn(producer(run, run.workload.rate * run.seconds, run.workload.rate))
     try:
@@ -548,6 +613,121 @@ def run_benchmark(run: Run) -> Path:
     return path
 
 
+def partition_leader(run: Run) -> int:
+    """Return the broker that leads partition 0 of the topic, as the cluster reports it."""
+    out = sh(client(run, "admin", f"{BIN}/kafka-topics.sh", "--bootstrap-server", run.bootstrap, "--describe", "--topic", TOPIC))
+    found = re.search(r"Partition: 0\s+Leader: (\d+)", out)
+    if found is None:
+        msg = f"partition 0 has no leader:\n{out[-2000:]}"
+        raise RuntimeError(msg)
+    return int(found[1])
+
+
+def read_acks(lines: Iterable[str], acked: list[tuple[int, int]], errors: list[str]) -> None:
+    """Collect (client time in ms, value) of each record kafka-verifiable-producer reports acknowledged, and each send error."""
+    for line in lines:
+        event = json.loads(line) if line.startswith("{") else {}
+        if event.get("name") == "producer_send_success":
+            acked.append((event["timestamp"], int(event["value"])))
+        elif event.get("name") == "producer_send_error":
+            errors.append(f"{event.get('exception')}: {event.get('message')}")
+
+
+def await_recovery(acked: list[tuple[int, int]], start: int) -> int:
+    """Wait until records were acknowledged for ACK_RUN_MS after the longest pause since acked[start]; return that pause in ms."""
+    deadline = time.monotonic() + FAILOVER_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        times = [t for t, _ in acked[start:]]
+        pause, end = max(((b - a, i + 1) for i, (a, b) in enumerate(itertools.pairwise(times))), default=(0, 0))
+        if times[-1] - times[end] >= ACK_RUN_MS:
+            return pause
+        time.sleep(0.5)
+    msg = f"no records acknowledged for {FAILOVER_TIMEOUT_SECONDS} s after the kill"
+    raise RuntimeError(msg)
+
+
+def consume_values(run: Run) -> list[int]:
+    """Read the whole topic with the console consumer and return the record values, checking the tool's own count."""
+    args = ["--bootstrap-server", run.bootstrap, "--topic", TOPIC, "--from-beginning", "--timeout-ms", "20000"]
+    out = sh(client(run, "consumer", f"{BIN}/kafka-console-consumer.sh", *args), check=False)
+    values = [int(line) for line in out.splitlines() if line.isdigit()]
+    total = re.search(r"Processed a total of (\d+) messages", out)
+    if total is None or int(total[1]) != len(values):
+        msg = f"consumer output does not add up:\n{out[-2000:]}"
+        raise RuntimeError(msg)
+    return values
+
+
+def verify_failover(target: Target) -> bool:
+    """Kill the leader of a one-partition topic under an acks=all producer, restarting it each time, then read the topic back.
+
+    Every acknowledged record must be read back; retries may duplicate records. The failover time the client sees is the
+    longest pause between acknowledgements after each kill, with otherwise default producer settings and acks=all.
+
+    Returns:
+        True when no acknowledged record is missing.
+    """
+    run = Run(
+        target=target,
+        workload=WORKLOADS["baseline"],
+        seconds=0,
+        partitions=1,
+        brokers=BROKERS,
+        replication_factor=REPLICATION_FACTOR,
+        bootstrap=ALL_BROKERS,
+        network=NETWORK,
+    )
+    if target.image == REDCRAB_IMAGE:
+        build_redcrab()
+    acked: list[tuple[int, int]] = []
+    errors: list[str] = []
+    pauses: list[int] = []
+    try:
+        cleanup(run)
+        compose(run, "up", "--detach", *(f"bench-{i}" for i in run.nodes))
+        wait_ready(run)
+        if target.name == "redpanda":
+            redpanda_settings()
+        create_topic(run)
+        script = (
+            f"printf '%s\\n' {' '.join(FAILOVER_PRODUCER_PROPS)} > /tmp/producer.properties && "
+            f"exec {BIN}/kafka-verifiable-producer.sh --bootstrap-server {run.bootstrap} --topic {TOPIC} "
+            f"--throughput {FAILOVER_RATE} --acks -1 --command-config /tmp/producer.properties"
+        )
+        cmd = client(run, "producer", "bash", "-c", script)
+        log(f"$ {shlex.join(cmd)}")
+        producer = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)  # noqa: S603
+        reader = threading.Thread(target=read_acks, args=(producer.stdout, acked, errors), daemon=True)
+        reader.start()
+        for kill in range(1, FAILOVER_KILLS + 1):
+            time.sleep(FAILOVER_SETTLE_SECONDS)
+            if not acked:
+                msg = "the producer has no acknowledged records"
+                raise RuntimeError(msg)
+            leader = partition_leader(run)
+            start = len(acked) - 1
+            sh(["podman", "kill", f"bench-{leader}"])
+            pauses.append(await_recovery(acked, start))
+            log(f"kill {kill}: bench-{leader} led partition 0; no record was acknowledged for {pauses[-1]:,} ms")
+            sh(["podman", "start", f"bench-{leader}"])
+        time.sleep(FAILOVER_SETTLE_SECONDS)
+        sh(["podman", "kill", "--signal", "TERM", "bench-producer"])
+        producer.wait(60)
+        reader.join(60)
+        consumed = consume_values(run)
+    finally:
+        cleanup(run)
+    distinct = {value for _, value in acked}
+    missing = sorted(distinct - set(consumed))
+    log(f"acknowledged {len(distinct):,} distinct records ({len(acked):,} acknowledgements, {len(errors):,} send errors)")
+    for error in sorted(set(errors)):
+        log(f"send error x{errors.count(error)}: {error}")
+    log(f"consumed {len(consumed):,} records, {len(consumed) - len(set(consumed)):,} of them duplicates")
+    log(f"failover seen by the client (longest pause in acknowledgements after each kill): {', '.join(f'{p:,}' for p in pauses)} ms")
+    log(f"LOST {len(missing):,} acknowledged records, for example {missing[:20]}" if missing else "no acknowledged record is missing")
+    return not missing
+
+
 def fmt(value: object, digits: int = 0) -> str:
     """Format a number for the comparison table."""
     return f"{value:,.{digits}f}" if isinstance(value, int | float) else str(value)
@@ -599,13 +779,26 @@ def latest_results(results: list[dict]) -> list[dict]:
     return list(latest.values())
 
 
+def capped(result: dict) -> bool:
+    """Tell whether a max run was cut short by the record cap."""
+    return bool(result.get("record_cap", {}).get("capped"))
+
+
+def run_seconds(result: dict) -> float:
+    """Return --seconds, or for a capped run its length at the steady-state rate it measured."""
+    if capped(result):
+        return result["record_cap"]["records"] / result["producer"]["records_per_sec"]
+    return result["workload"]["seconds"]
+
+
 def table_row(result: dict) -> tuple[str, ...]:
     """Format one result as a row of the comparison table."""
     p, c, w = result["producer"], result["consumer"], result["workload"]
     rate = "max" if w["rate"] < 0 else fmt(w["rate"])
     short = "*" if c["records"] < c["requested"] else ""
     layout = f"{broker_count(result) or '?'}/{w['replication_factor']}"
-    row = (result["target"], w["name"], layout, fmt(w["partitions"]), fmt(w["seconds"]), rate)
+    seconds = f"~{run_seconds(result):.0f} capped" if capped(result) else fmt(w["seconds"])
+    row = (result["target"], w["name"], layout, fmt(w["partitions"]), seconds, rate)
     row += (fmt(p["records_per_sec"]), fmt(p["mb_per_sec"], 1))
     row += tuple(fmt(p["latency_ms"][k]) for k in ("avg", "p50", "p95", "p99", "p99.9", "max"))
     return (*row, fmt(c["records_per_sec"]) + short, fmt(c["mb_per_sec"], 1), result["timestamp"])
@@ -639,7 +832,9 @@ def compare(*, every_run: bool = False) -> None:
     log(f"{NOTE}. VM: {', '.join(vms)}; broker container memory cap: {', '.join(caps)}.")
     log("Latency: producer send-to-ack (acks=all) from kafka-producer-perf-test, steady state. Backlog consumer: drain rate under live")
     log("produce. Consumer rates exclude group-join time. * = consumer stopped before reading every requested record. ? = broker")
-    log("count not recorded (broker not started by the harness).")
+    cap = MAX_RUN_BYTES // 2**30
+    log(f"count not recorded (broker not started by the harness). capped = max run cut to the {cap} GiB record cap (replicas and")
+    log("probe included); sec is then its length at the measured rate instead of --seconds.")
 
 
 def harness_managed(result: dict) -> bool:
@@ -648,9 +843,10 @@ def harness_managed(result: dict) -> bool:
 
 
 def method(result: dict) -> str:
-    """Identify what a run measured (image, build, workload settings, probe), so only like runs count as repeats."""
-    build = result.get("build", {}).get("commit")
-    return json.dumps([result["image"], build, result["workload"], "probe" in result], sort_keys=True)
+    """Identify what a run measured (image, build, workload settings, probe, record cap), so only like runs count as repeats."""
+    build = result.get("build", {})
+    binary = build.get("binary_sha256") or build.get("commit")
+    return json.dumps([result["image"], binary, result["workload"], "probe" in result, capped(result)], sort_keys=True)
 
 
 def chart_runs(results: list[dict], setup: Setup) -> dict[tuple[str, str], list[dict]]:
@@ -660,11 +856,6 @@ def chart_runs(results: list[dict], setup: Setup) -> dict[tuple[str, str], list[
         if setup_of(result) == setup and harness_managed(result):
             groups.setdefault((result["target"], result["workload"]["name"]), []).append(result)
     return {key: [r for r in runs if method(r) == method(runs[-1])] for key, runs in groups.items()}
-
-
-def needs_replication(target: str, setup: Setup) -> bool:
-    """Tell whether a target cannot run a setup because it has no replication yet."""
-    return target in TARGETS and not TARGETS[target].replicated and (setup[0] or 1) > 1
 
 
 def describe_workload(name: str) -> str:
@@ -715,10 +906,6 @@ def chart_notes(setup: Setup, groups: dict[tuple[str, str], list[dict]]) -> list
         names += [] if r["target"] in names else [r["target"]]
     settings = "; ".join(f"{' and '.join(names)}: {limit}" for limit, names in limits.items())
     notes.append(f"Broker settings (from the result files): {settings}. Containers have no CPU limit.")
-    absent = ", ".join(target for target in TARGETS if needs_replication(target, setup))
-    if absent:
-        single = setup_label(SETUPS[0])
-        notes.append(f"No run for {absent}: no replication yet. It runs only as {single}, and the {SETUPS[0][0]}-broker charts compare it.")
     seconds = sorted({r["workload"]["seconds"] for r in runs})
     span = f"{seconds[0]}-{seconds[-1]}" if len(seconds) > 1 else f"{seconds[0]}"
     counts = sorted({len(runs) for runs in groups.values()})
@@ -729,6 +916,17 @@ def chart_notes(setup: Setup, groups: dict[tuple[str, str], list[dict]]) -> list
         repeats += " and the thin gray marks under them the earlier runs."
     resolution = "Latency percentiles have 1 ms resolution."
     notes.append(f"{repeats} Results vary widely between runs{spread_example(groups)}. {resolution}")
+    cut = sorted(key for key, group in groups.items() if capped(group[-1]))
+    if cut:
+        lengths = "; ".join(
+            f"{target} {workload} ran about {' and '.join(f'{run_seconds(r):.0f}' for r in groups[target, workload])} s"
+            f" instead of {groups[target, workload][-1]['workload']['seconds']} s"
+            for target, workload in cut
+        )
+        notes.append(
+            f"Rows marked capped hit the harness's cap of {MAX_RUN_BYTES // 2**30} GiB written per run, replicas and probe included,"
+            f" so they ran shorter than the unmarked rows, which ran their full time: {lengths}.",
+        )
     days = sorted({r["timestamp"][:10] for r in runs})
     when = days[0] if len(days) == 1 else f"{days[0]} to {days[-1]}"
     notes.append(f"Runs from {when}. Full table: python3 bench/bench.py compare (with --all for every run).")
@@ -773,13 +971,12 @@ class Canvas:
 
 @dataclass(frozen=True)
 class Slot:
-    """One target's row inside one workload group: its latest run, the like runs before it, and what to say when it has none."""
+    """One target's row inside one workload group: its latest run and the like runs before it."""
 
     target: str
     workload: str
     result: dict | None
     others: tuple[dict, ...]
-    missing: str
     y: float
 
 
@@ -837,7 +1034,7 @@ def chart_header(canvas: Canvas, title: str, subtitle: str, legend: list[tuple[s
         canvas.text(column_x, 102, heading, ink="ink2", font_weight=600)
 
 
-def chart_rows(canvas: Canvas, setup: Setup, groups: dict[tuple[str, str], list[dict]]) -> tuple[list[Slot], list[tuple[float, float]]]:
+def chart_rows(canvas: Canvas, groups: dict[tuple[str, str], list[dict]]) -> tuple[list[Slot], list[tuple[float, float]]]:
     """Draw workload headings and target labels; return the row slots and the vertical span of each group's rows."""
     targets = [*TARGETS, *sorted({target for target, _ in groups} - set(TARGETS))]
     present = {workload for _, workload in groups}
@@ -853,18 +1050,17 @@ def chart_rows(canvas: Canvas, setup: Setup, groups: dict[tuple[str, str], list[
         start = y
         for target in targets:
             runs = groups.get((target, workload), [])
-            missing = "no run: needs replication" if needs_replication(target, setup) else "no run"
-            canvas.text(28, y + 17, target)
-            slots.append(Slot(target, workload, runs[-1] if runs else None, tuple(runs[:-1]), missing, y + 13))
+            canvas.text(28, y + 17, f"{target} (capped)" if runs and capped(runs[-1]) else target)
+            slots.append(Slot(target, workload, runs[-1] if runs else None, tuple(runs[:-1]), y + 13))
             y += ROW_HEIGHT + RUN_GAP * max(len(runs) - 1, 0)
         spans.append((start, y))
         y += GROUP_GAP
     return slots, spans
 
 
-def no_run(theme: dict[str, str], x: float, y: float, text: str) -> str:
+def no_run(theme: dict[str, str], x: float, y: float) -> str:
     """Mark a target without a result for a workload, so a missing run never reads as zero."""
-    return element("text", esc(text), x=x, y=y + 4, font_size=11.5, fill=theme["ink2"], font_style="italic")
+    return element("text", "no run", x=x, y=y + 4, font_size=11.5, fill=theme["ink2"], font_style="italic")
 
 
 def ms_label(ms: float) -> str:
@@ -875,7 +1071,7 @@ def ms_label(ms: float) -> str:
 def latency_row(theme: dict[str, str], slot: Slot, x: Callable[[float], float]) -> str:
     """The p50 to p99 range of the latest run (connector, two markers, both values), earlier runs under it, and a tooltip."""
     if slot.result is None:
-        return no_run(theme, x(1), slot.y, slot.missing)
+        return no_run(theme, x(1), slot.y)
     latency = slot.result["producer"]["latency_ms"]
     p50, p99 = latency["p50"], latency["p99"]
     x50, x99 = x(p50), x(p99)
@@ -906,7 +1102,7 @@ def latency_chart(setup: Setup, groups: dict[tuple[str, str], list[dict]], theme
     title = f"Publish latency, p50 to p99: {setup_label(setup)}"
     subtitle = "Producer send-to-ack with acks=all at steady state. Left dot p50, right dot p99."
     chart_header(canvas, title, subtitle, [("p50", "p50"), ("p99", "p99"), *repeat_legend(groups, "range")], [(left, "ms, log scale")])
-    slots, spans = chart_rows(canvas, setup, groups)
+    slots, spans = chart_rows(canvas, groups)
     values = [r["producer"]["latency_ms"][p] for runs in groups.values() for r in runs for p in ("p50", "p99")]
     low = 10 ** math.floor(math.log10(max(min(values), 1)))
     decades = math.ceil(math.log10(max(max(values), low * 10) / low))
@@ -932,7 +1128,7 @@ def tick_step(peak: float) -> float:
 def throughput_row(theme: dict[str, str], slot: Slot, x0: float, scale: float, side: str) -> str:
     """The latest run's MB/s bar and value, earlier runs under it; * marks a consumer that stopped before reading all."""
     if slot.result is None:
-        return no_run(theme, x0 + 6, slot.y, slot.missing)
+        return no_run(theme, x0 + 6, slot.y)
     stats = slot.result[side]
     short = "*" if stats.get("records", 0) < stats.get("requested", 0) else ""
     label = f"{stats['mb_per_sec']:,.1f}{short}"
@@ -970,7 +1166,7 @@ def throughput_chart(setup: Setup, groups: dict[tuple[str, str], list[dict]], th
     ticks = repeat_legend(groups, "thin")
     legend = [("bar", "latest run"), *ticks] if ticks else []
     chart_header(canvas, title, subtitle, legend, [(x0, f"{side.capitalize()} MB/s") for x0, side in sides])
-    slots, spans = chart_rows(canvas, setup, groups)
+    slots, spans = chart_rows(canvas, groups)
     for x0, side in sides:
         throughput_side(canvas, slots, spans, x0, width - 52, side)
     if any(runs[-1]["consumer"]["records"] < runs[-1]["consumer"]["requested"] for runs in groups.values()):
@@ -1030,6 +1226,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     tables = commands.add_parser("compare", help="one table per setup with the latest result per target and workload")
     tables.add_argument("--all", action="store_true", dest="every_run", help="list every result instead of the latest")
     commands.add_parser("chart", help="light and dark SVG charts per setup, written to bench/charts/")
+    failover = commands.add_parser("verify-failover", help="kill partition leaders under acks=all load and check for lost records")
+    failover.add_argument("target", choices=TARGETS)
     return parser.parse_args(argv)
 
 
@@ -1043,14 +1241,14 @@ def main(argv: list[str]) -> int:
     if args.command == "chart":
         chart()
         return 0
+    if args.command == "verify-failover":
+        return 0 if verify_failover(TARGETS[args.target]) else 1
     target = TARGETS[args.target]
     if target.name != "redcrab" and (args.bootstrap or args.replication_factor):
         sys.exit("--bootstrap and --replication-factor apply to redcrab only")
     if args.bootstrap and args.brokers:
         sys.exit("--brokers applies only to brokers the harness starts")
-    if not target.replicated and args.brokers not in {None, 1}:
-        sys.exit(f"{target.name} has no replication yet, so it runs as one broker only")
-    brokers = args.brokers or (BROKERS if target.replicated else 1)
+    brokers = args.brokers or (1 if args.bootstrap else BROKERS)
     if args.bootstrap:
         target = replace(target, compose=None, image=None, broker_memory=UNMANAGED)
     run = Run(
