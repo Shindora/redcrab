@@ -1,463 +1,196 @@
-//! Broker state: the topic registry persisted in the data dir, partition logs and the group-commit write path.
+//! Broker: the Kafka-facing state of one node: its place in the cluster and its replicas, the group
+//! coordinator, and producer ids.
 
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{self, Write};
-use std::mem;
-use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kafka_protocol::ResponseError;
-use tokio::sync::{oneshot, watch};
-use tracing::{debug, error, info};
-use uuid::Uuid;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tracing::warn;
 
+use crate::cluster::{Cluster, Peer, StartError, Topic};
 use crate::group::Coordinator;
-use crate::storage::{Log, LogConfig, StorageError};
+use crate::replica::{Replica, View};
 
-const TOPICS_FILE: &str = "topics";
-const GROUPS_DIR: &str = "groups";
+/// Producer ids carry the node id above this many bits, so nodes never hand out the same id.
+const PRODUCER_ID_NODE_SHIFT: u32 = 48;
+const SINGLE_NODE_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Static settings of one broker process.
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
-    /// Node id reported in metadata.
+    /// Node id, also the Kafka broker id.
     pub node_id: i32,
     /// Host clients are told to connect to.
     pub advertised_host: String,
     /// Port clients are told to connect to.
     pub advertised_port: u16,
-    /// Directory holding topic metadata and partition logs.
+    /// Directory holding the metadata log and the partition logs.
     pub data_dir: PathBuf,
+    /// Every node of the cluster, this one included; empty for a cluster of this node alone.
+    pub peers: Vec<Peer>,
 }
 
-/// Shared state of a single-node broker.
+/// Shared state of one broker.
 pub struct Broker {
     /// Settings this broker was started with.
     pub config: BrokerConfig,
-    topics: RwLock<Topics>,
-    admin: tokio::sync::Mutex<()>,
-    // ponytail: one broker-wide flush signal wakes every waiting fetch; per-partition wakeups once long-polls are many.
-    flushes: Arc<watch::Sender<u64>>,
-    next_producer_id: AtomicI64,
+    cluster: Arc<Cluster>,
     groups: Coordinator,
+    next_producer_id: AtomicI64,
+    watcher: Mutex<Option<JoinHandle<()>>>,
 }
-
-#[derive(Default)]
-struct Topics {
-    by_name: HashMap<String, Arc<Topic>>,
-    by_id: HashMap<Uuid, Arc<Topic>>,
-}
-
-/// A topic and its partitions.
-pub struct Topic {
-    /// Topic name.
-    pub name: String,
-    /// Stable topic id.
-    pub id: Uuid,
-    /// Partitions indexed by partition number.
-    pub partitions: Vec<Arc<Partition>>,
-}
-
-impl Topic {
-    /// Partition `index`, if it exists.
-    #[must_use]
-    pub fn partition(&self, index: i32) -> Option<&Arc<Partition>> {
-        usize::try_from(index)
-            .ok()
-            .and_then(|i| self.partitions.get(i))
-    }
-}
-
-/// One partition: its log plus the queue of appends waiting for the next group commit.
-pub struct Partition {
-    /// Only locked from blocking threads; tokio's mutex is FIFO-fair, so fetch reads are not starved
-    /// by back-to-back commit rounds holding it across fsync.
-    log: tokio::sync::Mutex<Log>,
-    queue: Mutex<CommitQueue>,
-    high_watermark: AtomicI64,
-    log_start: AtomicI64,
-    flushes: Arc<watch::Sender<u64>>,
-}
-
-#[derive(Default)]
-struct CommitQueue {
-    pending: Vec<Append>,
-    running: bool,
-}
-
-struct Append {
-    records: Vec<u8>,
-    batches: Vec<Range<usize>>,
-    reply: oneshot::Sender<Result<i64, i16>>,
-}
-
-/// Outcome of an append: the first assigned offset, or a Kafka error code.
-pub type AppendResult = oneshot::Receiver<Result<i64, i16>>;
 
 impl Broker {
-    /// Loads topic metadata from `config.data_dir` and opens every partition log. Blocking.
+    /// Starts this node of the cluster: its replicas, its transport on `rpc_listener` (needed
+    /// when there are other nodes) and its group coordinator. A node alone in its cluster returns
+    /// once it has replayed its metadata and leads every partition; with peers, it returns at once
+    /// and partitions become available as their leaders are elected.
     ///
     /// # Errors
-    /// Fails when the data dir cannot be read or a log cannot be opened.
-    pub fn open(config: BrokerConfig) -> Result<Broker, StorageError> {
-        fs::create_dir_all(&config.data_dir)?;
-        let flushes = Arc::new(watch::channel(0).0);
-        let mut topics = Topics::default();
-        for (id, partitions, name) in load_topics(&config.data_dir)? {
-            let topic = open_topic(&config.data_dir, name, id, partitions, &flushes)?;
-            info!(topic = %topic.name, id = %topic.id, partitions, "loaded topic");
-            topics.insert(Arc::new(topic));
+    ///
+    /// Fails for an inconsistent configuration, a data directory of another node or format, or an
+    /// I/O failure while starting.
+    pub async fn start(
+        config: BrokerConfig,
+        rpc_listener: Option<std::net::TcpListener>,
+    ) -> Result<Arc<Broker>, StartError> {
+        let peers = if config.peers.is_empty() {
+            vec![Peer {
+                id: config.node_id,
+                rpc_address: String::new(),
+                host: config.advertised_host.clone(),
+                port: config.advertised_port,
+            }]
+        } else {
+            config.peers.clone()
+        };
+        let cluster =
+            Cluster::start(config.node_id, peers, config.data_dir.clone(), rpc_listener).await?;
+        if cluster.peers.len() == 1 && !cluster.wait_ready(SINGLE_NODE_READY_TIMEOUT).await {
+            warn!("not every partition has a leader yet; serving anyway");
         }
-        let groups = Coordinator::open(config.data_dir.join(GROUPS_DIR))?;
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis());
-        Ok(Broker {
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0));
+        // ponytail: the low bits are seeded from wall-clock millis, not persisted; a clock step back across a restart can reuse ids.
+        let first_producer_id = (i64::from(config.node_id) << PRODUCER_ID_NODE_SHIFT)
+            | (millis & ((1 << PRODUCER_ID_NODE_SHIFT) - 1));
+        let changes = cluster.controller_changes();
+        let broker = Arc::new(Broker {
             config,
-            topics: RwLock::new(topics),
-            admin: tokio::sync::Mutex::new(()),
-            flushes,
-            // ponytail: producer ids are seeded from wall-clock millis, not persisted; a clock step back across restart can reuse ids.
-            next_producer_id: AtomicI64::new(i64::try_from(millis).unwrap_or(0)),
-            groups,
-        })
+            cluster,
+            groups: Coordinator::default(),
+            next_producer_id: AtomicI64::new(first_producer_id),
+            watcher: Mutex::new(None),
+        });
+        let watcher = tokio::spawn(reset_groups_on_controller_change(
+            Arc::downgrade(&broker),
+            changes,
+        ));
+        *broker
+            .watcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(watcher);
+        Ok(broker)
     }
 
-    /// The consumer-group coordinator; this node coordinates every group.
+    /// Stops the replicas and the transport; the broker answers nothing useful afterwards.
+    pub async fn shutdown(&self) {
+        if let Some(watcher) = self
+            .watcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            watcher.abort();
+        }
+        let cluster = Arc::clone(&self.cluster);
+        let _ = tokio::task::spawn_blocking(move || cluster.shutdown()).await;
+    }
+
+    /// The cluster this broker belongs to.
+    pub(crate) fn cluster(&self) -> &Arc<Cluster> {
+        &self.cluster
+    }
+
+    /// The consumer-group coordinator; only the controller coordinates groups.
     pub(crate) fn groups(&self) -> &Coordinator {
         &self.groups
     }
 
-    /// Topic by name.
-    pub fn topic(&self, name: &str) -> Option<Arc<Topic>> {
-        read(&self.topics).by_name.get(name).cloned()
-    }
-
-    /// Topic by id.
-    pub fn topic_by_id(&self, id: Uuid) -> Option<Arc<Topic>> {
-        read(&self.topics).by_id.get(&id).cloned()
-    }
-
-    /// Every topic, sorted by name.
-    pub fn topics(&self) -> Vec<Arc<Topic>> {
-        let mut all: Vec<_> = read(&self.topics).by_name.values().cloned().collect();
-        all.sort_by(|a, b| a.name.cmp(&b.name));
-        all
-    }
-
-    /// Receiver that changes after every successful flush on any partition.
-    pub fn flushes(&self) -> watch::Receiver<u64> {
-        self.flushes.subscribe()
-    }
-
-    /// Hands out a producer id never returned before by this process.
+    /// Hands out a producer id never returned before by any node of the cluster.
     pub fn next_producer_id(&self) -> i64 {
         self.next_producer_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Creates a topic, its partition logs and persists the registry before returning.
+    /// This node's replica of partition `index` of `topic`, if this node leads it.
     ///
     /// # Errors
-    /// Returns the Kafka error code to report for this topic.
-    pub async fn create_topic(&self, name: String, partitions: i32) -> Result<Arc<Topic>, i16> {
-        let _admin = self.admin.lock().await;
-        if self.topic(&name).is_some() {
-            return Err(ResponseError::TopicAlreadyExists.code());
-        }
-        let dir = self.config.data_dir.clone();
-        let flushes = Arc::clone(&self.flushes);
-        let mut listing = self.listing();
-        let topic = tokio::task::spawn_blocking(move || {
-            let topic = open_topic(&dir, name, Uuid::new_v4(), partitions, &flushes)?;
-            listing.push((topic.id, partitions, topic.name.clone()));
-            save_topics(&dir, &listing)?;
-            Ok::<_, StorageError>(Arc::new(topic))
-        })
-        .await
-        .map_err(|e| storage_failure(&e))?
-        .map_err(|e| storage_failure(&e))?;
-        write(&self.topics).insert(Arc::clone(&topic));
-        info!(topic = %topic.name, id = %topic.id, partitions, "created topic");
-        Ok(topic)
+    ///
+    /// `UNKNOWN_TOPIC_OR_PARTITION` for a partition the topic lacks, `NOT_LEADER_OR_FOLLOWER` when
+    /// this node does not lead it.
+    pub(crate) fn leader_replica(&self, topic: &Topic, index: i32) -> Result<Arc<Replica>, i16> {
+        let key = topic
+            .group(index)
+            .ok_or(ResponseError::UnknownTopicOrPartition.code())?;
+        self.cluster
+            .replica(key)
+            .filter(|replica| replica.view().leader == Some(self.cluster.id))
+            .ok_or(ResponseError::NotLeaderOrFollower.code())
     }
+}
 
-    /// Deletes a topic from the registry and removes its data.
-    ///
-    /// # Errors
-    /// Returns the Kafka error code to report for this topic.
-    pub async fn delete_topic(&self, topic: &Topic) -> Result<(), i16> {
-        let _admin = self.admin.lock().await;
-        if self.topic_by_id(topic.id).is_none() {
-            return Err(ResponseError::UnknownTopicId.code());
-        }
-        let dir = self.config.data_dir.clone();
-        let id = topic.id;
-        let listing: Vec<_> = self.listing().into_iter().filter(|t| t.0 != id).collect();
-        tokio::task::spawn_blocking(move || save_topics(&dir, &listing))
-            .await
-            .map_err(|e| storage_failure(&e))?
-            .map_err(|e| storage_failure(&e))?;
-        {
-            let mut topics = write(&self.topics);
-            topics.by_id.remove(&id);
-            topics.by_name.remove(&topic.name);
-        }
-        let topic_dir = self.config.data_dir.join(id.to_string());
-        match tokio::task::spawn_blocking(move || fs::remove_dir_all(topic_dir)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => error!(%id, "removing topic data failed: {e}"),
-            Err(e) => error!(%id, "removing topic data failed: {e}"),
-        }
-        info!(topic = %topic.name, %id, "deleted topic");
+/// Checks a request's `current_leader_epoch` against the leader's term; a negative one skips the
+/// check.
+///
+/// # Errors
+///
+/// `FENCED_LEADER_EPOCH` for an older epoch, `UNKNOWN_LEADER_EPOCH` for a newer one.
+pub(crate) fn check_leader_epoch(view: View, requested: i32) -> Result<(), i16> {
+    if requested < 0 || requested == view.term {
         Ok(())
-    }
-
-    fn listing(&self) -> Vec<(Uuid, i32, String)> {
-        read(&self.topics)
-            .by_name
-            .values()
-            .map(|t| {
-                (
-                    t.id,
-                    i32::try_from(t.partitions.len()).unwrap_or(i32::MAX),
-                    t.name.clone(),
-                )
-            })
-            .collect()
+    } else if requested < view.term {
+        Err(ResponseError::FencedLeaderEpoch.code())
+    } else {
+        Err(ResponseError::UnknownLeaderEpoch.code())
     }
 }
 
-impl Topics {
-    fn insert(&mut self, topic: Arc<Topic>) {
-        self.by_id.insert(topic.id, Arc::clone(&topic));
-        self.by_name.insert(topic.name.clone(), topic);
-    }
-}
-
-impl Partition {
-    fn new(log: Log, flushes: Arc<watch::Sender<u64>>) -> Partition {
-        Partition {
-            high_watermark: AtomicI64::new(log.end_offset()),
-            log_start: AtomicI64::new(log.start_offset()),
-            log: tokio::sync::Mutex::new(log),
-            queue: Mutex::new(CommitQueue::default()),
-            flushes,
-        }
-    }
-
-    /// Offset after the last flushed batch; consumers never see past it.
-    pub fn high_watermark(&self) -> i64 {
-        self.high_watermark.load(Ordering::Acquire)
-    }
-
-    /// First offset in the log.
-    pub fn log_start_offset(&self) -> i64 {
-        self.log_start.load(Ordering::Acquire)
-    }
-
-    /// Queues `records` (already split into `batches`) for the next group commit. The receiver resolves
-    /// with the first assigned offset once the data is flushed. Appends queued while a flush is in flight
-    /// are written and flushed together by the next round.
-    pub fn append(self: &Arc<Self>, records: Vec<u8>, batches: Vec<Range<usize>>) -> AppendResult {
-        let (reply, result) = oneshot::channel();
-        let start = {
-            let mut queue = lock(&self.queue);
-            queue.pending.push(Append {
-                records,
-                batches,
-                reply,
-            });
-            !mem::replace(&mut queue.running, true)
-        };
-        if start {
-            let partition = Arc::clone(self);
-            tokio::task::spawn_blocking(move || partition.commit_rounds());
-        }
-        result
-    }
-
-    fn commit_rounds(&self) {
-        loop {
-            let mut group = {
-                let mut queue = lock(&self.queue);
-                if queue.pending.is_empty() {
-                    queue.running = false;
-                    return;
-                }
-                mem::take(&mut queue.pending)
-            };
-            let mut log = self.log.blocking_lock();
-            let results: Vec<_> = group.iter_mut().map(|a| append_all(&mut log, a)).collect();
-            let flushed = log.flush();
-            let end = log.end_offset();
-            drop(log);
-            match flushed {
-                Ok(()) => {
-                    self.high_watermark.store(end, Ordering::Release);
-                    self.flushes.send_modify(|n| *n += 1);
-                    debug!(appends = group.len(), end, "group commit flushed");
-                    for (append, result) in group.into_iter().zip(results) {
-                        let _ = append.reply.send(result);
-                    }
-                }
-                Err(e) => {
-                    error!("flush failed: {e}");
-                    let code = error_code(&e);
-                    for append in group {
-                        let _ = append.reply.send(Err(code));
-                    }
-                }
-            }
-        }
-    }
-
-    /// Whole batches from `offset` below the high watermark, up to `max_bytes` but at least one. Blocking.
-    ///
-    /// # Errors
-    /// Returns the Kafka error code for an out-of-range offset or a storage failure.
-    pub fn read(&self, offset: i64, max_bytes: usize) -> Result<Vec<u8>, i16> {
-        let log = self.log.blocking_lock();
-        let high_watermark = self.high_watermark();
-        let mut data = log.read(offset, max_bytes).map_err(|e| error_code(&e))?;
-        data.truncate(batches_below(&data, high_watermark));
-        Ok(data)
-    }
-
-    /// Offset of the first batch at or after `timestamp_ms`. Blocking.
-    pub fn offset_for_timestamp(&self, timestamp_ms: i64) -> Option<i64> {
-        let offset = self
-            .log
-            .blocking_lock()
-            .offset_for_timestamp(timestamp_ms)?;
-        (offset < self.high_watermark()).then_some(offset)
-    }
-}
-
-fn append_all(log: &mut Log, append: &mut Append) -> Result<i64, i16> {
-    let mut first = None;
-    for range in &append.batches {
-        let base = log
-            .append(&mut append.records[range.clone()])
-            .map_err(|e| error_code(&e))?;
-        first.get_or_insert(base);
-    }
-    first.ok_or(ResponseError::CorruptMessage.code())
-}
-
-/// Length of the leading whole batches in `data` whose base offset is below `end`.
-fn batches_below(data: &[u8], end: i64) -> usize {
-    let mut pos = 0;
-    while let Some(header) = data.get(pos..pos + 12) {
-        let base = i64::from_be_bytes(header[..8].try_into().unwrap_or_default());
-        let len = i32::from_be_bytes(header[8..12].try_into().unwrap_or_default());
-        let next = usize::try_from(len).map_or(usize::MAX, |len| pos + 12 + len);
-        if base >= end || next > data.len() {
-            break;
-        }
-        pos = next;
-    }
-    pos
-}
-
-/// Kafka error code for a storage failure.
-fn error_code(error: &StorageError) -> i16 {
-    match error {
-        StorageError::Io(_) => ResponseError::KafkaStorageError.code(),
-        StorageError::InvalidBatch(_) => ResponseError::CorruptMessage.code(),
-        StorageError::OffsetOutOfRange { .. } => ResponseError::OffsetOutOfRange.code(),
-    }
-}
-
-fn storage_failure(error: &dyn std::fmt::Display) -> i16 {
-    error!("storage operation failed: {error}");
-    ResponseError::KafkaStorageError.code()
-}
-
-fn open_topic(
-    data_dir: &Path,
-    name: String,
-    id: Uuid,
-    partitions: i32,
-    flushes: &Arc<watch::Sender<u64>>,
-) -> Result<Topic, StorageError> {
-    let partitions = (0..partitions)
-        .map(|p| {
-            let log = Log::open(
-                &data_dir.join(id.to_string()).join(p.to_string()),
-                LogConfig::default(),
-            )?;
-            Ok(Arc::new(Partition::new(log, Arc::clone(flushes))))
-        })
-        .collect::<Result<_, StorageError>>()?;
-    Ok(Topic {
-        name,
-        id,
-        partitions,
-    })
-}
-
-fn load_topics(data_dir: &Path) -> io::Result<Vec<(Uuid, i32, String)>> {
-    let text = match fs::read_to_string(data_dir.join(TOPICS_FILE)) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
+/// Group membership lives in memory on the controller; when the controller changes, members
+/// rediscover it and rejoin, so whatever this node held is dropped.
+async fn reset_groups_on_controller_change(
+    broker: Weak<Broker>,
+    mut changes: watch::Receiver<View>,
+) {
+    let mut last = {
+        let view = *changes.borrow_and_update();
+        (view.term, view.leader)
     };
-    text.lines()
-        .map(|line| {
-            let mut fields = line.splitn(3, '\t');
-            let id = fields.next().and_then(|f| Uuid::parse_str(f).ok());
-            let partitions = fields.next().and_then(|f| f.parse().ok());
-            let name = fields.next().map(str::to_owned);
-            match (id, partitions, name) {
-                (Some(id), Some(partitions), Some(name)) => Ok((id, partitions, name)),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("bad line in topics file: {line:?}"),
-                )),
-            }
-        })
-        .collect()
-}
-
-fn save_topics(data_dir: &Path, topics: &[(Uuid, i32, String)]) -> io::Result<()> {
-    let mut text = Vec::new();
-    for (id, partitions, name) in topics {
-        writeln!(text, "{id}\t{partitions}\t{name}")?;
+    while changes.changed().await.is_ok() {
+        let view = *changes.borrow_and_update();
+        let Some(broker) = broker.upgrade() else {
+            return;
+        };
+        if (view.term, view.leader) != last {
+            last = (view.term, view.leader);
+            broker.groups.reset();
+        }
     }
-    replace_file(data_dir, TOPICS_FILE, &text)
-}
-
-/// Durably replaces `dir/name` with `contents`: written to a temp file, fsynced, renamed over the
-/// old file and the directory fsynced, so a crash leaves either the old or the new contents.
-pub(crate) fn replace_file(dir: &Path, name: &str, contents: &[u8]) -> io::Result<()> {
-    let tmp = dir.join(format!("{name}.tmp"));
-    let mut file = File::create(&tmp)?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    fs::rename(&tmp, dir.join(name))?;
-    File::open(dir)?.sync_all()
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    lock.read().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    lock.write().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::path::Path;
+
+    use bytes::BytesMut;
+
     use super::*;
     use crate::api::tests::batch;
+    use crate::cluster::TopicSpec;
 
     pub(crate) fn config(dir: &Path) -> BrokerConfig {
         BrokerConfig {
@@ -465,136 +198,99 @@ pub(crate) mod tests {
             advertised_host: "127.0.0.1".into(),
             advertised_port: 9092,
             data_dir: dir.to_path_buf(),
+            peers: Vec::new(),
         }
     }
 
-    async fn read(partition: &Arc<Partition>, offset: i64, max_bytes: usize) -> Vec<u8> {
-        let partition = Arc::clone(partition);
-        tokio::task::spawn_blocking(move || partition.read(offset, max_bytes).unwrap())
+    async fn create(broker: &Broker, name: &str, partitions: i32) -> Arc<Topic> {
+        let spec = TopicSpec {
+            name: name.into(),
+            partitions,
+            replication_factor: -1,
+            assignments: Vec::new(),
+        };
+        let created = broker
+            .cluster()
+            .create_topic(&spec, Duration::from_secs(10))
             .await
-            .unwrap()
+            .unwrap();
+        assert_eq!(created.replication_factor, 1);
+        broker.cluster().topic_by_id(created.id).unwrap()
     }
 
-    fn whole(records: &[u8]) -> (Vec<u8>, Vec<Range<usize>>) {
-        (
-            records.to_vec(),
-            std::iter::once(0..records.len()).collect(),
-        )
+    async fn read(replica: &Arc<Replica>, offset: i64) -> BytesMut {
+        let replica = Arc::clone(replica);
+        tokio::task::spawn_blocking(move || {
+            let mut out = BytesMut::new();
+            for extent in replica.locate(offset, usize::MAX, true, i64::MAX).unwrap() {
+                extent.read_into(&mut out).unwrap();
+            }
+            out
+        })
+        .await
+        .unwrap()
     }
 
-    #[tokio::test]
-    async fn group_commit_flushes_queued_appends_together() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn single_node_commits_on_its_own_flush_and_replays_after_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let flushes = Arc::new(watch::channel(0).0);
-        let partition = Arc::new(Partition::new(
-            Log::open(dir.path(), LogConfig::default()).unwrap(),
-            Arc::clone(&flushes),
-        ));
-        let (one, two) = (batch(&["a"]), batch(&["b", "c"]));
-
-        let flush_in_flight = partition.log.try_lock().unwrap();
-        let results: Vec<_> = [&one, &two, &one, &two]
-            .into_iter()
-            .map(|records| {
-                let (records, batches) = whole(records);
-                partition.append(records, batches)
-            })
-            .collect();
-        assert_eq!(
-            partition.high_watermark(),
-            0,
-            "nothing is visible before the flush"
-        );
-        drop(flush_in_flight);
-
-        let mut offsets = Vec::new();
-        for result in results {
-            offsets.push(result.await.unwrap().unwrap());
+        let broker = Broker::start(config(dir.path()), None).await.unwrap();
+        let topic = create(&broker, "orders", 3).await;
+        let leader = broker.leader_replica(&topic, 2).unwrap();
+        while !leader.view().ready {
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(offsets, [0, 1, 3, 4]);
-        assert_eq!(partition.high_watermark(), 6);
-        assert!(
-            *flushes.borrow() <= 2,
-            "4 appends queued behind one busy round took {} flushes",
-            *flushes.borrow()
-        );
-        assert_eq!(
-            read(&partition, 0, usize::MAX).await.len(),
-            2 * (one.len() + two.len())
-        );
-    }
+        assert_eq!(leader.high_watermark(), 1, "the new leader's no-op");
 
-    #[tokio::test]
-    async fn group_commit_assigns_offsets_to_multi_batch_appends() {
-        let dir = tempfile::tempdir().unwrap();
-        let partition = Arc::new(Partition::new(
-            Log::open(dir.path(), LogConfig::default()).unwrap(),
-            Arc::new(watch::channel(0).0),
-        ));
         let (one, two) = (batch(&["a"]), batch(&["b", "c"]));
         let records = [one.clone(), two.clone()].concat();
-        let first = partition.append(
+        let first = leader.propose(
             records,
             vec![0..one.len(), one.len()..one.len() + two.len()],
         );
-        let (records, batches) = whole(&one);
-        let second = partition.append(records, batches);
-        assert_eq!(first.await.unwrap(), Ok(0));
-        assert_eq!(second.await.unwrap(), Ok(3));
-        let stored = read(&partition, 1, 1).await;
+        let second = leader.propose(one.clone(), std::iter::once(0..one.len()).collect());
+        assert_eq!(first.await.unwrap(), Ok(1));
+        assert_eq!(second.await.unwrap(), Ok(4));
+        assert_eq!(leader.high_watermark(), 5);
+        let stored = read(&leader, 1).await;
         assert_eq!(
             &stored[..8],
             &1_i64.to_be_bytes(),
-            "read starts at the batch holding offset 1"
+            "stamped with its offset"
         );
-        assert_eq!(stored.len(), two.len(), "max_bytes stops after one batch");
+        assert_eq!(stored.len(), 2 * one.len() + two.len());
+        assert_eq!(
+            broker.leader_replica(&topic, 3).err(),
+            Some(ResponseError::UnknownTopicOrPartition.code())
+        );
+        broker.shutdown().await;
+        drop((leader, broker));
+
+        let broker = Broker::start(config(dir.path()), None).await.unwrap();
+        let topic = broker.cluster().topic("orders").unwrap();
+        assert_eq!(topic.partition_count(), 3);
+        let leader = broker.leader_replica(&topic, 2).unwrap();
+        assert_eq!(leader.high_watermark(), 6, "everything, and a second no-op");
+        assert_eq!(read(&leader, 1).await.len(), stored.len() + 72);
+        broker.shutdown().await;
     }
 
     #[test]
-    fn batches_below_cuts_at_the_high_watermark() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut log = Log::open(dir.path(), LogConfig::default()).unwrap();
-        let (mut one, mut two) = (batch(&["a", "b"]), batch(&["c"]));
-        log.append(&mut one).unwrap();
-        log.append(&mut two).unwrap();
-        let data = log.read(0, usize::MAX).unwrap();
-        assert_eq!(batches_below(&data, 3), data.len());
-        assert_eq!(batches_below(&data, 2), one.len());
-        assert_eq!(batches_below(&data, 0), 0);
-        assert_eq!(batches_below(&data[..data.len() - 1], 3), one.len());
-    }
-
-    #[tokio::test]
-    async fn create_topic_survives_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let broker = Broker::open(config(dir.path())).unwrap();
-        let created = broker.create_topic("orders".into(), 3).await.unwrap();
+    fn leader_epoch_checks_fence_old_and_refuse_unknown_epochs() {
+        let view = View {
+            term: 5,
+            leader: Some(1),
+            ready: true,
+        };
+        assert_eq!(check_leader_epoch(view, -1), Ok(()));
+        assert_eq!(check_leader_epoch(view, 5), Ok(()));
         assert_eq!(
-            broker.create_topic("orders".into(), 1).await.err(),
-            Some(ResponseError::TopicAlreadyExists.code())
+            check_leader_epoch(view, 4),
+            Err(ResponseError::FencedLeaderEpoch.code())
         );
-        let (records, batches) = whole(&batch(&["kept"]));
-        created
-            .partition(2)
-            .unwrap()
-            .append(records, batches)
-            .await
-            .unwrap()
-            .unwrap();
-        drop((created, broker));
-
-        let reopened = Broker::open(config(dir.path())).unwrap();
-        let topic = reopened.topic("orders").unwrap();
-        assert_eq!(topic.partitions.len(), 3);
-        assert_eq!(reopened.topic_by_id(topic.id).unwrap().name, "orders");
-        assert_eq!(topic.partition(2).unwrap().high_watermark(), 1);
-
-        reopened.delete_topic(&topic).await.unwrap();
-        assert!(
-            Broker::open(config(dir.path()))
-                .unwrap()
-                .topics()
-                .is_empty()
+        assert_eq!(
+            check_leader_epoch(view, 6),
+            Err(ResponseError::UnknownLeaderEpoch.code())
         );
     }
 }

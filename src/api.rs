@@ -1,11 +1,12 @@
 //! Request handlers, one per implemented Kafka API, plus the advertised version table.
 
 use std::future::Future;
+use std::io;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use kafka_protocol::ResponseError;
 use kafka_protocol::messages::api_versions_response::ApiVersion;
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
@@ -13,7 +14,9 @@ use kafka_protocol::messages::create_topics_response::CreatableTopicResult;
 use kafka_protocol::messages::delete_topics_response::DeletableTopicResult;
 use kafka_protocol::messages::describe_configs_response::DescribeConfigsResult;
 use kafka_protocol::messages::describe_groups_response::DescribedGroup;
-use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
+use kafka_protocol::messages::fetch_response::{
+    EpochEndOffset, FetchableTopicResponse, LeaderIdAndEpoch, PartitionData, SnapshotId,
+};
 use kafka_protocol::messages::find_coordinator_response::Coordinator as CoordinatorNode;
 use kafka_protocol::messages::leave_group_response::MemberResponse;
 use kafka_protocol::messages::list_offsets_response::{
@@ -30,6 +33,9 @@ use kafka_protocol::messages::offset_fetch_response::{
     OffsetFetchResponseGroup, OffsetFetchResponsePartition, OffsetFetchResponsePartitions,
     OffsetFetchResponseTopic, OffsetFetchResponseTopics,
 };
+use kafka_protocol::messages::offset_for_leader_epoch_response::{
+    EpochEndOffset as LeaderEpochEndOffset, OffsetForLeaderTopicResult,
+};
 use kafka_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
 use kafka_protocol::messages::{
     AddOffsetsToTxnResponse, ApiKey, ApiVersionsRequest, ApiVersionsResponse, BrokerId,
@@ -41,19 +47,27 @@ use kafka_protocol::messages::{
     JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, ListGroupsRequest,
     ListGroupsResponse, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest, MetadataResponse,
     OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse,
-    ProduceRequest, ProduceResponse, ProducerId, PushTelemetryResponse, ResponseKind,
-    SaslAuthenticateResponse, SaslHandshakeResponse, SyncGroupRequest, SyncGroupResponse,
-    TopicName,
+    OffsetForLeaderEpochRequest, OffsetForLeaderEpochResponse, ProduceRequest, ProduceResponse,
+    ProducerId, PushTelemetryResponse, ResponseKind, SaslAuthenticateResponse,
+    SaslHandshakeResponse, SyncGroupRequest, SyncGroupResponse, TopicName,
 };
 use kafka_protocol::protocol::{Message, Request, StrBytes, VersionRange};
-use tokio::time::{Instant, sleep_until};
+use tokio::sync::mpsc;
+use tokio::time::{Instant, sleep_until, timeout_at};
+use tracing::warn;
 use uuid::Uuid;
 
-use crate::broker::{Broker, Partition, Topic};
+use crate::broker::{Broker, check_leader_epoch};
+use crate::cluster::{Cluster, Refusal, Topic, TopicRef, TopicSpec};
 use crate::group::{self, ClientInfo, Committed};
+use crate::replica::Replica;
+use crate::storage::Extent;
 
-const CLUSTER_ID: &str = "redcrab-single-node";
-const MAX_PARTITIONS: i32 = 10_000;
+const CLUSTER_ID: &str = "redcrab";
+/// Largest record batch accepted, so that replicating one stays within a transport frame.
+pub const MAX_BATCH_BYTES: usize = 8 << 20;
+/// Logs keep everything from offset 0; see the ponytail in `raft`.
+const LOG_START_OFFSET: i64 = 0;
 const BATCH_HEADER_LEN: usize = 61;
 const EARLIEST_TIMESTAMP: i64 = -2;
 const LATEST_TIMESTAMP: i64 = -1;
@@ -86,6 +100,7 @@ pub fn implemented(key: ApiKey) -> Option<VersionRange> {
         ApiKey::DescribeGroups => both::<DescribeGroupsRequest>(),
         ApiKey::ListGroups => both::<ListGroupsRequest>(),
         ApiKey::DescribeConfigs => both::<DescribeConfigsRequest>(),
+        ApiKey::OffsetForLeaderEpoch => both::<OffsetForLeaderEpochRequest>(),
         _ => return None,
     })
 }
@@ -168,42 +183,46 @@ pub fn valid_topic_name(name: &str) -> bool {
 
 /// Answers a `Metadata` request. No topic is ever auto-created.
 pub fn metadata(broker: &Broker, version: i16, request: &MetadataRequest) -> MetadataResponse {
+    let cluster = broker.cluster();
     let topics = match &request.topics {
         Some(wanted) if !(wanted.is_empty() && version == 0) => wanted
             .iter()
-            .map(|t| requested_topic(broker, version, t))
+            .map(|t| requested_topic(cluster, version, t))
             .collect(),
-        _ => broker
+        _ => cluster
             .topics()
             .iter()
-            .map(|t| topic_metadata(broker, t))
+            .map(|t| topic_metadata(cluster, t))
             .collect(),
     };
-    let config = &broker.config;
-    let node = BrokerId(config.node_id);
-    MetadataResponse::default()
-        .with_brokers(vec![
+    let brokers = cluster
+        .peers
+        .iter()
+        .map(|peer| {
             MetadataResponseBroker::default()
-                .with_node_id(node)
-                .with_host(StrBytes::from_string(config.advertised_host.clone()))
-                .with_port(i32::from(config.advertised_port)),
-        ])
+                .with_node_id(BrokerId(peer.id))
+                .with_host(StrBytes::from_string(peer.host.clone()))
+                .with_port(i32::from(peer.port))
+        })
+        .collect();
+    MetadataResponse::default()
+        .with_brokers(brokers)
         .with_cluster_id(Some(StrBytes::from_static_str(CLUSTER_ID)))
-        .with_controller_id(node)
+        .with_controller_id(BrokerId(cluster.controller().unwrap_or(-1)))
         .with_topics(topics)
 }
 
 fn requested_topic(
-    broker: &Broker,
+    cluster: &Cluster,
     version: i16,
     wanted: &MetadataRequestTopic,
 ) -> MetadataResponseTopic {
     let found = match &wanted.name {
-        Some(name) => broker.topic(name),
-        None => broker.topic_by_id(wanted.topic_id),
+        Some(name) => cluster.topic(name),
+        None => cluster.topic_by_id(wanted.topic_id),
     };
     if let Some(topic) = found {
-        return topic_metadata(broker, &topic);
+        return topic_metadata(cluster, &topic);
     }
     let error = match &wanted.name {
         Some(name) if !valid_topic_name(name) => ResponseError::InvalidTopicException,
@@ -221,17 +240,25 @@ fn requested_topic(
         .with_topic_id(wanted.topic_id)
 }
 
-fn topic_metadata(broker: &Broker, topic: &Topic) -> MetadataResponseTopic {
-    let node = BrokerId(broker.config.node_id);
+fn topic_metadata(cluster: &Cluster, topic: &Topic) -> MetadataResponseTopic {
     let partitions = (0..)
-        .zip(&topic.partitions)
-        .map(|(index, _)| {
-            MetadataResponsePartition::default()
+        .zip(&topic.replicas)
+        .map(|(index, replicas)| {
+            let nodes: Vec<BrokerId> = replicas.iter().map(|&id| BrokerId(id)).collect();
+            let partition = MetadataResponsePartition::default()
                 .with_partition_index(index)
-                .with_leader_id(node)
-                .with_leader_epoch(0)
-                .with_replica_nodes(vec![node])
-                .with_isr_nodes(vec![node])
+                .with_replica_nodes(nodes.clone())
+                // ponytail: every replica is reported in sync; tracking which followers are caught up is the upgrade.
+                .with_isr_nodes(nodes);
+            match topic.group(index).and_then(|key| cluster.leader(key)) {
+                Some((leader, epoch)) => partition
+                    .with_leader_id(BrokerId(leader))
+                    .with_leader_epoch(epoch),
+                None => partition
+                    .with_error_code(ResponseError::LeaderNotAvailable.code())
+                    .with_leader_id(BrokerId(-1))
+                    .with_leader_epoch(-1),
+            }
         })
         .collect();
     MetadataResponseTopic::default()
@@ -240,87 +267,67 @@ fn topic_metadata(broker: &Broker, topic: &Topic) -> MetadataResponseTopic {
         .with_partitions(partitions)
 }
 
-/// Answers a `CreateTopics` request; topics are durable in the data dir before the response is sent.
+/// Answers a `CreateTopics` request. The controller creates each topic in the replicated metadata
+/// log; the answer comes once this broker has applied it and, within the request's timeout, every
+/// new partition has a leader.
 pub async fn create_topics(broker: &Broker, request: CreateTopicsRequest) -> CreateTopicsResponse {
+    let wait = millis(request.timeout_ms);
     let mut results = Vec::with_capacity(request.topics.len());
     for wanted in &request.topics {
         let result = CreatableTopicResult::default().with_name(wanted.name.clone());
-        results.push(
-            match create_topic(broker, wanted, request.validate_only).await {
-                Ok((id, partitions)) => result
-                    .with_topic_id(id)
-                    .with_num_partitions(partitions)
-                    .with_replication_factor(1)
-                    .with_configs(Some(Vec::new())),
-                Err((code, message)) => result
-                    .with_error_code(code)
-                    .with_error_message(message.map(StrBytes::from_static_str)),
-            },
-        );
+        let created = match topic_spec(wanted) {
+            Ok(spec) if request.validate_only => broker.cluster().validate_topic(&spec),
+            Ok(spec) => broker.cluster().create_topic(&spec, wait).await,
+            Err(refusal) => Err(refusal),
+        };
+        results.push(match created {
+            Ok(created) => result
+                .with_topic_id(created.id)
+                .with_num_partitions(created.partitions)
+                .with_replication_factor(created.replication_factor)
+                .with_configs(Some(Vec::new())),
+            Err(refusal) => result
+                .with_error_code(refusal.code)
+                .with_error_message(refusal.message.map(StrBytes::from_string)),
+        });
     }
     CreateTopicsResponse::default().with_topics(results)
 }
 
-async fn create_topic(
-    broker: &Broker,
-    wanted: &CreatableTopic,
-    validate_only: bool,
-) -> Result<(Uuid, i32), (i16, Option<&'static str>)> {
-    let partitions = match (wanted.num_partitions, wanted.assignments.len()) {
-        (-1, 0) => 1,
-        (-1, n) => i32::try_from(n).unwrap_or(i32::MAX),
-        (n, _) => n,
-    };
-    let only_this_node = [BrokerId(broker.config.node_id)];
-    if !valid_topic_name(&wanted.name) {
-        return Err((
-            ResponseError::InvalidTopicException.code(),
-            Some("topic names are 1-249 characters of [a-zA-Z0-9._-]"),
-        ));
-    }
-    if !(1..=MAX_PARTITIONS).contains(&partitions) {
-        return Err((
-            ResponseError::InvalidPartitions.code(),
-            Some("partition count must be between 1 and 10000"),
-        ));
-    }
-    if !matches!(wanted.replication_factor, -1 | 1) {
-        return Err((
-            ResponseError::InvalidReplicationFactor.code(),
-            Some("single-node broker: replication factor must be 1"),
-        ));
-    }
-    if !wanted.assignments.is_empty()
-        && (wanted.num_partitions != -1
-            || wanted
-                .assignments
-                .iter()
-                .any(|a| a.broker_ids != only_this_node))
+fn topic_spec(wanted: &CreatableTopic) -> Result<TopicSpec, Refusal> {
+    let mut assignments: Vec<_> = wanted.assignments.iter().collect();
+    assignments.sort_by_key(|a| a.partition_index);
+    if (0..)
+        .zip(&assignments)
+        .any(|(index, a)| a.partition_index != index)
     {
-        return Err((
-            ResponseError::InvalidReplicaAssignment.code(),
-            Some("replicas can only be assigned to this node"),
-        ));
+        return Err(Refusal {
+            code: ResponseError::InvalidReplicaAssignment.code(),
+            message: Some("assignments must name partitions 0 to n-1 once each".into()),
+        });
     }
-    if validate_only {
-        return match broker.topic(&wanted.name) {
-            Some(_) => Err((ResponseError::TopicAlreadyExists.code(), None)),
-            None => Ok((Uuid::nil(), partitions)),
-        };
-    }
-    let topic = broker
-        .create_topic(wanted.name.to_string(), partitions)
-        .await
-        .map_err(|code| (code, None))?;
-    Ok((topic.id, partitions))
+    Ok(TopicSpec {
+        name: wanted.name.to_string(),
+        partitions: wanted.num_partitions,
+        replication_factor: wanted.replication_factor,
+        assignments: assignments
+            .iter()
+            .map(|a| a.broker_ids.iter().map(|id| id.0).collect())
+            .collect(),
+    })
 }
 
-/// Answers a `DeleteTopics` request.
+fn millis(ms: i32) -> Duration {
+    Duration::from_millis(u64::try_from(ms).unwrap_or(0))
+}
+
+/// Answers a `DeleteTopics` request once each deletion is applied on this broker.
 pub async fn delete_topics(
     broker: &Broker,
     version: i16,
     request: DeleteTopicsRequest,
 ) -> DeleteTopicsResponse {
+    let wait = millis(request.timeout_ms);
     let wanted: Vec<_> = if version >= 6 {
         request
             .topics
@@ -336,68 +343,72 @@ pub async fn delete_topics(
     };
     let mut responses = Vec::with_capacity(wanted.len());
     for (name, id) in wanted {
-        let found = match &name {
-            Some(name) => broker.topic(name),
-            None => broker.topic_by_id(id),
+        let target = match &name {
+            Some(name) => TopicRef::Name(name.to_string()),
+            None => TopicRef::Id(id),
         };
         let mut result = DeletableTopicResult::default()
             .with_name(name.clone())
             .with_topic_id(id);
-        match found {
-            Some(topic) => match broker.delete_topic(&topic).await {
-                Ok(()) => {
-                    result.name = Some(topic_name(&topic.name));
-                    result.topic_id = topic.id;
-                }
-                Err(code) => result.error_code = code,
-            },
-            None if name.is_some() => {
-                result.error_code = ResponseError::UnknownTopicOrPartition.code();
+        match broker.cluster().delete_topic(target, wait).await {
+            Ok((id, deleted)) => {
+                result.name = Some(topic_name(&deleted));
+                result.topic_id = id;
             }
-            None => result.error_code = ResponseError::UnknownTopicId.code(),
+            Err(refusal) => {
+                result.error_code = refusal.code;
+                result.error_message = refusal.message.map(StrBytes::from_string);
+            }
         }
         responses.push(result);
     }
     DeleteTopicsResponse::default().with_responses(responses)
 }
 
-/// Starts a `Produce`: every batch is queued for append before this returns, so request order is
-/// append order. The future resolves once all touched partitions are flushed, or immediately with
-/// `None` for acks=0, which gets no response.
+/// Starts a `Produce`: every batch is proposed to its partition's leader before this returns, so
+/// request order is append order. The future resolves once each proposal is committed on a majority
+/// of its replicas, has failed, or the request's timeout has passed; immediately with `None` for
+/// acks=0, which gets no response.
 pub fn produce(
     broker: &Broker,
     version: i16,
     request: ProduceRequest,
 ) -> impl Future<Output = Option<ProduceResponse>> + Send + use<> {
     let acks = request.acks;
+    let deadline = Instant::now() + millis(request.timeout_ms);
     let mut responses = Vec::with_capacity(request.topic_data.len());
     let mut pending = Vec::new();
     for (t, wanted) in request.topic_data.into_iter().enumerate() {
         let (topic, unknown) = if version >= 13 {
             (
-                broker.topic_by_id(wanted.topic_id),
+                broker.cluster().topic_by_id(wanted.topic_id),
                 ResponseError::UnknownTopicId,
             )
         } else {
             (
-                broker.topic(&wanted.name),
+                broker.cluster().topic(&wanted.name),
                 ResponseError::UnknownTopicOrPartition,
             )
         };
         let mut partitions = Vec::with_capacity(wanted.partition_data.len());
         for (p, data) in wanted.partition_data.into_iter().enumerate() {
             let mut response = PartitionProduceResponse::default().with_index(data.index);
-            let partition = topic.as_ref().and_then(|topic| topic.partition(data.index));
+            let leader = topic
+                .as_ref()
+                .ok_or(unknown.code())
+                .and_then(|topic| broker.leader_replica(topic, data.index));
             let records = data.records.unwrap_or_default();
-            match (partition, split_batches(&records)) {
+            match (leader, split_batches(&records)) {
                 _ if !matches!(acks, -1..=1) => {
                     response.error_code = ResponseError::InvalidRequiredAcks.code();
                 }
-                (None, _) => response.error_code = unknown.code(),
-                (Some(_), Err(code)) => response.error_code = code,
-                (Some(partition), Ok(batches)) => {
-                    response.log_start_offset = partition.log_start_offset();
-                    pending.push((t, p, partition.append(records.to_vec(), batches)));
+                (Err(code), _) | (Ok(_), Err(code)) => response.error_code = code,
+                (Ok(_), Ok(batches)) if batches.iter().any(|b| b.len() > MAX_BATCH_BYTES) => {
+                    response.error_code = ResponseError::MessageTooLarge.code();
+                }
+                (Ok(leader), Ok(batches)) => {
+                    response.log_start_offset = LOG_START_OFFSET;
+                    pending.push((t, p, leader.propose(records.to_vec(), batches)));
                 }
             }
             partitions.push(response);
@@ -413,12 +424,14 @@ pub fn produce(
         if acks == 0 {
             return None;
         }
-        for (t, p, appended) in pending {
+        // ponytail: acks=1 waits for a majority like acks=all; acknowledging on the leader's own flush is the upgrade.
+        for (t, p, proposed) in pending {
             let response = &mut responses[t].partition_responses[p];
-            match appended.await {
-                Ok(Ok(base_offset)) => response.base_offset = base_offset,
-                Ok(Err(code)) => response.error_code = code,
-                Err(_) => response.error_code = ResponseError::KafkaStorageError.code(),
+            match timeout_at(deadline, proposed).await {
+                Ok(Ok(Ok(base_offset))) => response.base_offset = base_offset,
+                Ok(Ok(Err(code))) => response.error_code = code,
+                Ok(Err(_)) => response.error_code = ResponseError::NotLeaderOrFollower.code(),
+                Err(_) => response.error_code = ResponseError::RequestTimedOut.code(),
             }
         }
         Some(ProduceResponse::default().with_responses(responses))
@@ -463,56 +476,59 @@ pub fn split_batches(records: &[u8]) -> Result<Vec<Range<usize>>, i16> {
 struct FetchTarget {
     topic: usize,
     index: i32,
-    partition: Option<Arc<Partition>>,
+    replica: Option<Arc<Replica>>,
     error: i16,
     offset: i64,
     max_bytes: usize,
 }
 
 impl FetchTarget {
+    /// Whether the partition has records past the fetch offset, or an answer that cannot change.
     fn ready(&self) -> bool {
         self.error != 0
-            || self
-                .partition
-                .as_ref()
-                .is_some_and(|p| p.high_watermark() != self.offset)
+            || self.replica.as_ref().is_some_and(|r| {
+                self.offset < r.high_watermark()
+                    || !(LOG_START_OFFSET..=r.log_end_offset()).contains(&self.offset)
+            })
     }
 }
 
-/// Answers a sessionless `Fetch`, waiting up to `max_wait_ms` for `min_bytes` of new flushed data.
-pub async fn fetch(broker: Arc<Broker>, version: i16, request: FetchRequest) -> FetchResponse {
+/// Answers a sessionless `Fetch` on partition leaders, waiting up to `max_wait_ms` for `min_bytes`
+/// of newly committed data.
+pub async fn fetch(broker: Arc<Broker>, version: i16, request: FetchRequest) -> FetchBody {
     if request.session_id != 0 {
-        return FetchResponse::default()
-            .with_error_code(ResponseError::FetchSessionIdNotFound.code());
+        let response =
+            FetchResponse::default().with_error_code(ResponseError::FetchSessionIdNotFound.code());
+        return FetchBody::new(version, &response, Vec::new());
     }
+    let cluster = broker.cluster();
     let mut topics = Vec::with_capacity(request.topics.len());
     let mut targets = Vec::new();
     for (t, wanted) in request.topics.into_iter().enumerate() {
         let (topic, unknown) = if version >= 13 {
             (
-                broker.topic_by_id(wanted.topic_id),
+                cluster.topic_by_id(wanted.topic_id),
                 ResponseError::UnknownTopicId,
             )
         } else {
             (
-                broker.topic(&wanted.topic),
+                cluster.topic(&wanted.topic),
                 ResponseError::UnknownTopicOrPartition,
             )
         };
         for p in &wanted.partitions {
-            let partition = topic
+            let replica = topic
                 .as_ref()
-                .and_then(|topic| topic.partition(p.partition))
-                .cloned();
+                .ok_or(unknown.code())
+                .and_then(|topic| broker.leader_replica(topic, p.partition))
+                .and_then(|replica| {
+                    check_leader_epoch(replica.view(), p.current_leader_epoch).map(|()| replica)
+                });
             targets.push(FetchTarget {
                 topic: t,
                 index: p.partition,
-                error: if partition.is_some() {
-                    0
-                } else {
-                    unknown.code()
-                },
-                partition,
+                error: replica.as_ref().err().copied().unwrap_or(0),
+                replica: replica.ok(),
                 offset: p.fetch_offset,
                 max_bytes: usize::try_from(p.partition_max_bytes).unwrap_or(0),
             });
@@ -528,31 +544,31 @@ pub async fn fetch(broker: Arc<Broker>, version: i16, request: FetchRequest) -> 
     let mut deadline =
         Instant::now() + Duration::from_millis(u64::try_from(request.max_wait_ms).unwrap_or(0));
     let targets = Arc::new(targets);
-    let mut flushes = broker.flushes();
+    let mut flushes = cluster.commits();
     loop {
         flushes.borrow_and_update();
         let expired = Instant::now() >= deadline;
         if expired || min_bytes == 0 || targets.iter().any(FetchTarget::ready) {
-            let reading = Arc::clone(&targets);
-            let partitions =
-                tokio::task::spawn_blocking(move || read_partitions(&reading, max_bytes))
+            let locating = Arc::clone(&targets);
+            let found =
+                tokio::task::spawn_blocking(move || locate_partitions(&locating, max_bytes))
                     .await
                     .unwrap_or_else(|_| {
+                        let code = ResponseError::KafkaStorageError.code();
                         targets
                             .iter()
-                            .map(|t| partition_data(t, ResponseError::KafkaStorageError.code()))
+                            .map(|t| (partition_data(t, code), Vec::new()))
                             .collect()
                     });
-            let bytes: usize = partitions
-                .iter()
-                .filter_map(|p| p.records.as_ref())
-                .map(Bytes::len)
-                .sum();
-            if expired || bytes >= min_bytes || partitions.iter().any(|p| p.error_code != 0) {
-                for (target, data) in targets.iter().zip(partitions) {
+            let bytes: usize = found.iter().flat_map(|(_, e)| e).map(Extent::size).sum();
+            if expired || bytes >= min_bytes || found.iter().any(|(p, _)| p.error_code != 0) {
+                let mut extents = Vec::with_capacity(found.len());
+                for (target, (data, found)) in targets.iter().zip(found) {
                     topics[target.topic].partitions.push(data);
+                    extents.push(found);
                 }
-                return FetchResponse::default().with_responses(topics);
+                let response = FetchResponse::default().with_responses(topics);
+                return FetchBody::new(version, &response, extents);
             }
         }
         tokio::select! {
@@ -568,46 +584,233 @@ fn partition_data(target: &FetchTarget, code: i16) -> PartitionData {
         .with_error_code(code)
 }
 
-/// Reads every target, honouring partition and response byte limits; only the first non-empty
-/// partition may exceed them, by a single batch, so the consumer always makes progress.
-fn read_partitions(targets: &[FetchTarget], max_bytes: usize) -> Vec<PartitionData> {
+/// Locates the records of every target, honouring partition and response byte limits; only the first
+/// non-empty partition may exceed them, by a single batch, so the consumer always makes progress.
+fn locate_partitions(
+    targets: &[FetchTarget],
+    max_bytes: usize,
+) -> Vec<(PartitionData, Vec<Extent>)> {
     let mut remaining = max_bytes;
     let mut first = true;
     targets
         .iter()
         .map(|target| {
-            let Some(partition) = &target.partition else {
-                return partition_data(target, target.error);
+            let Some(replica) = &target.replica else {
+                return (partition_data(target, target.error), Vec::new());
             };
             let limit = target.max_bytes.min(remaining);
+            let high_watermark = replica.high_watermark();
             let mut data = partition_data(target, 0);
-            if limit > 0 || first {
-                match partition.read(target.offset, limit) {
-                    Ok(records) if !records.is_empty() && (first || records.len() <= limit) => {
-                        first = false;
-                        remaining = remaining.saturating_sub(records.len());
-                        data.records = Some(Bytes::from(records));
-                    }
-                    Ok(_) => {}
+            let mut extents = Vec::new();
+            if !(LOG_START_OFFSET..=replica.log_end_offset()).contains(&target.offset) {
+                data.error_code = ResponseError::OffsetOutOfRange.code();
+            } else if target.offset < high_watermark && (limit > 0 || first) {
+                match replica.locate(target.offset, limit, first, high_watermark) {
+                    Ok(found) => extents = found,
                     Err(code) => data.error_code = code,
                 }
             }
-            let high_watermark = partition.high_watermark();
-            data.with_high_watermark(high_watermark)
+            let len: usize = extents.iter().map(Extent::size).sum();
+            if len > 0 {
+                first = false;
+                remaining = remaining.saturating_sub(len);
+            }
+            let data = data
+                .with_high_watermark(high_watermark)
                 .with_last_stable_offset(high_watermark)
-                .with_log_start_offset(partition.log_start_offset())
+                .with_log_start_offset(LOG_START_OFFSET);
+            (data, extents)
         })
         .collect()
 }
 
-/// Answers `ListOffsets` for the earliest, latest (high watermark) and timestamp lookups.
+/// The body of a `Fetch` response, written while its records are still being read: `len` bytes,
+/// arriving in order on `chunks`, so the first partitions are on the wire while later ones are read.
+pub struct FetchBody {
+    /// Length of the whole body.
+    pub len: usize,
+    /// The body in order; an error means it cannot be completed.
+    pub chunks: mpsc::UnboundedReceiver<io::Result<Bytes>>,
+}
+
+impl FetchBody {
+    /// Starts reading `extents`, the records of each partition of `response` in order.
+    fn new(version: i16, response: &FetchResponse, extents: Vec<Vec<Extent>>) -> FetchBody {
+        let (sender, chunks) = mpsc::unbounded_channel();
+        let lengths: Vec<_> = extents
+            .iter()
+            .map(|e| Some(e.iter().map(Extent::size).sum()))
+            .collect();
+        let mut head = BytesMut::new();
+        match encode_fetch(response, version, &lengths, &mut head) {
+            Ok(positions) => {
+                let records: Vec<_> = positions
+                    .into_iter()
+                    .zip(extents)
+                    .filter(|(_, extents)| !extents.is_empty())
+                    .collect();
+                let len = head.len() + lengths.into_iter().flatten().sum::<usize>();
+                tokio::task::spawn_blocking(move || {
+                    read_body(&head.freeze(), &records, len, &sender);
+                });
+                FetchBody { len, chunks }
+            }
+            Err(e) => {
+                let _ = sender.send(Err(e));
+                FetchBody { len: 0, chunks }
+            }
+        }
+    }
+}
+
+/// Sends `head` with the records read into it at their positions, `len` bytes in all, cut after each
+/// record set so each goes out as soon as it is read.
+fn read_body(
+    head: &Bytes,
+    records: &[(usize, Vec<Extent>)],
+    len: usize,
+    chunks: &mpsc::UnboundedSender<io::Result<Bytes>>,
+) {
+    let mut from = records.first().map_or(head.len(), |(at, _)| *at);
+    if chunks.send(Ok(head.slice(..from))).is_err() {
+        return;
+    }
+    // ponytail: one fresh buffer per fetch; a pool would spare musl an mmap and page faults per fetch.
+    let mut buffer = BytesMut::with_capacity(len - from);
+    for (i, (_, extents)) in records.iter().enumerate() {
+        for extent in extents {
+            if let Err(e) = extent.read_into(&mut buffer) {
+                warn!("reading fetched records failed: {e}");
+                let _ = chunks.send(Err(e));
+                return;
+            }
+        }
+        let to = records.get(i + 1).map_or(head.len(), |(at, _)| *at);
+        buffer.extend_from_slice(&head[from..to]);
+        from = to;
+        if chunks.send(Ok(buffer.split().freeze())).is_err() {
+            return;
+        }
+    }
+}
+
+/// Encodes `response` as `FetchResponse::encode` does, except that each partition's records field
+/// holds only the length prefix from `lengths` (one per partition, in order; `None` for null). Returns
+/// where in `head` each partition's record bytes belong.
+///
+/// # Errors
+/// Fails for a field this does not encode (tagged fields, aborted transactions) or a length that does
+/// not fit the wire format.
+fn encode_fetch(
+    response: &FetchResponse,
+    version: i16,
+    lengths: &[Option<usize>],
+    head: &mut BytesMut,
+) -> io::Result<Vec<usize>> {
+    let unsupported = || io::Error::new(io::ErrorKind::InvalidData, "unsupported Fetch response");
+    let compact = version >= 12;
+    let plain = (4..=18).contains(&version)
+        && (version >= 7 || response.session_id == 0)
+        && response.node_endpoints.is_empty()
+        && response.unknown_tagged_fields.is_empty();
+    if !plain {
+        return Err(unsupported());
+    }
+    let mut lengths = lengths.iter();
+    let mut positions = Vec::with_capacity(lengths.len());
+    head.put_i32(response.throttle_time_ms);
+    if version >= 7 {
+        head.put_i16(response.error_code);
+        head.put_i32(response.session_id);
+    }
+    put_len(head, Some(response.responses.len()), compact)?;
+    for topic in &response.responses {
+        if !topic.unknown_tagged_fields.is_empty() {
+            return Err(unsupported());
+        }
+        if version >= 13 {
+            head.put_slice(topic.topic_id.as_bytes());
+        } else if compact {
+            put_len(head, Some(topic.topic.len()), compact)?;
+            head.put_slice(topic.topic.as_bytes());
+        } else {
+            head.put_i16(i16::try_from(topic.topic.len()).map_err(|_| unsupported())?);
+            head.put_slice(topic.topic.as_bytes());
+        }
+        put_len(head, Some(topic.partitions.len()), compact)?;
+        for partition in &topic.partitions {
+            let plain = partition.diverging_epoch == EpochEndOffset::default()
+                && partition.current_leader == LeaderIdAndEpoch::default()
+                && partition.snapshot_id == SnapshotId::default()
+                && partition.unknown_tagged_fields.is_empty()
+                && partition
+                    .aborted_transactions
+                    .as_ref()
+                    .is_none_or(Vec::is_empty)
+                && (version >= 11 || partition.preferred_read_replica.0 == -1);
+            if !plain {
+                return Err(unsupported());
+            }
+            head.put_i32(partition.partition_index);
+            head.put_i16(partition.error_code);
+            head.put_i64(partition.high_watermark);
+            head.put_i64(partition.last_stable_offset);
+            if version >= 5 {
+                head.put_i64(partition.log_start_offset);
+            }
+            let aborted = partition.aborted_transactions.as_ref().map(Vec::len);
+            put_len(head, aborted, compact)?;
+            if version >= 11 {
+                head.put_i32(partition.preferred_read_replica.0);
+            }
+            put_len(head, *lengths.next().ok_or_else(unsupported)?, compact)?;
+            positions.push(head.len());
+            if compact {
+                head.put_u8(0);
+            }
+        }
+        if compact {
+            head.put_u8(0);
+        }
+    }
+    if compact {
+        head.put_u8(0);
+    }
+    Ok(positions)
+}
+
+/// Length prefix of a nullable field: an unsigned varint of `len + 1` in flexible versions, otherwise
+/// an `i32` with `-1` for null, as arrays and bytes use.
+fn put_len(head: &mut BytesMut, len: Option<usize>, compact: bool) -> io::Result<()> {
+    let too_long = || io::Error::new(io::ErrorKind::InvalidData, "field too long to encode");
+    if compact {
+        let mut value = match len {
+            Some(len) => u32::try_from(len)
+                .ok()
+                .and_then(|len| len.checked_add(1))
+                .ok_or_else(too_long)?,
+            None => 0,
+        };
+        while value >= 0x80 {
+            head.put_u8(u8::try_from(value & 0x7f).map_err(|_| too_long())? | 0x80);
+            value >>= 7;
+        }
+        head.put_u8(u8::try_from(value).map_err(|_| too_long())?);
+    } else {
+        head.put_i32(len.map_or(Ok(-1), i32::try_from).map_err(|_| too_long())?);
+    }
+    Ok(())
+}
+
+/// Answers `ListOffsets` on partition leaders for the earliest, latest (high watermark) and
+/// timestamp lookups.
 pub async fn list_offsets(broker: Arc<Broker>, request: ListOffsetsRequest) -> ListOffsetsResponse {
     let topics = tokio::task::spawn_blocking(move || {
         request
             .topics
             .into_iter()
             .map(|wanted| {
-                let topic = broker.topic(&wanted.name);
+                let topic = broker.cluster().topic(&wanted.name);
                 let partitions = wanted
                     .partitions
                     .iter()
@@ -615,26 +818,19 @@ pub async fn list_offsets(broker: Arc<Broker>, request: ListOffsetsRequest) -> L
                         let mut response = ListOffsetsPartitionResponse::default()
                             .with_partition_index(p.partition_index)
                             .with_timestamp(-1)
-                            .with_offset(-1);
-                        match topic.as_ref().and_then(|t| t.partition(p.partition_index)) {
-                            None => {
-                                response.error_code = ResponseError::UnknownTopicOrPartition.code();
-                            }
-                            Some(partition) => match p.timestamp {
-                                EARLIEST_TIMESTAMP => {
-                                    response.offset = partition.log_start_offset();
-                                }
-                                LATEST_TIMESTAMP => response.offset = partition.high_watermark(),
-                                timestamp if timestamp >= 0 => {
-                                    if let Some(offset) = partition.offset_for_timestamp(timestamp)
-                                    {
-                                        response.offset = offset;
-                                        // ponytail: echoes the requested timestamp, not the matched record's; needs a record-level lookup.
-                                        response.timestamp = timestamp;
-                                    }
-                                }
-                                _ => response.error_code = ResponseError::InvalidRequest.code(),
-                            },
+                            .with_offset(-1)
+                            .with_leader_epoch(-1);
+                        let leader = topic
+                            .as_ref()
+                            .ok_or(ResponseError::UnknownTopicOrPartition.code())
+                            .and_then(|t| broker.leader_replica(t, p.partition_index))
+                            .and_then(|replica| {
+                                check_leader_epoch(replica.view(), p.current_leader_epoch)
+                                    .map(|()| replica)
+                            });
+                        match leader {
+                            Err(code) => response.error_code = code,
+                            Ok(replica) => list_offset(&replica, p.timestamp, &mut response),
                         }
                         response
                     })
@@ -648,6 +844,85 @@ pub async fn list_offsets(broker: Arc<Broker>, request: ListOffsetsRequest) -> L
     .await
     .unwrap_or_default();
     ListOffsetsResponse::default().with_topics(topics)
+}
+
+fn list_offset(replica: &Replica, timestamp: i64, response: &mut ListOffsetsPartitionResponse) {
+    match timestamp {
+        EARLIEST_TIMESTAMP => {
+            response.offset = LOG_START_OFFSET;
+            response.leader_epoch = replica.epoch_at(LOG_START_OFFSET).unwrap_or(-1);
+        }
+        // A new leader's high watermark is relearned; until an entry of its own term commits it can
+        // be lower than one already handed out, and a consumer resetting to latest would rewind.
+        LATEST_TIMESTAMP if !replica.view().ready => {
+            response.error_code = ResponseError::OffsetNotAvailable.code();
+        }
+        LATEST_TIMESTAMP => {
+            let high_watermark = replica.high_watermark();
+            response.offset = high_watermark;
+            response.leader_epoch = replica.epoch_at(high_watermark - 1).unwrap_or(-1);
+        }
+        timestamp if timestamp >= 0 => {
+            if let Some(offset) = replica.offset_for_timestamp(timestamp) {
+                response.offset = offset;
+                response.leader_epoch = replica.epoch_at(offset).unwrap_or(-1);
+                // ponytail: echoes the requested timestamp, not the matched record's; needs a record-level lookup.
+                response.timestamp = timestamp;
+            }
+        }
+        _ => response.error_code = ResponseError::InvalidRequest.code(),
+    }
+}
+
+/// Answers `OffsetsForLeaderEpoch` on partition leaders: for each requested epoch, the largest
+/// epoch in the log at or below it and where that epoch ends.
+pub async fn offsets_for_leader_epoch(
+    broker: Arc<Broker>,
+    request: OffsetForLeaderEpochRequest,
+) -> OffsetForLeaderEpochResponse {
+    let topics = tokio::task::spawn_blocking(move || {
+        request
+            .topics
+            .into_iter()
+            .map(|wanted| {
+                let topic = broker.cluster().topic(&wanted.topic);
+                let partitions = wanted
+                    .partitions
+                    .iter()
+                    .map(|p| {
+                        let mut result = LeaderEpochEndOffset::default()
+                            .with_partition(p.partition)
+                            .with_leader_epoch(-1)
+                            .with_end_offset(-1);
+                        let leader = topic
+                            .as_ref()
+                            .ok_or(ResponseError::UnknownTopicOrPartition.code())
+                            .and_then(|t| broker.leader_replica(t, p.partition))
+                            .and_then(|replica| {
+                                check_leader_epoch(replica.view(), p.current_leader_epoch)
+                                    .map(|()| replica)
+                            });
+                        match leader {
+                            Err(code) => result.error_code = code,
+                            Ok(replica) => {
+                                if let Some((epoch, end)) = replica.epoch_end(p.leader_epoch) {
+                                    result.leader_epoch = epoch;
+                                    result.end_offset = end;
+                                }
+                            }
+                        }
+                        result
+                    })
+                    .collect();
+                OffsetForLeaderTopicResult::default()
+                    .with_topic(wanted.topic)
+                    .with_partitions(partitions)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+    OffsetForLeaderEpochResponse::default().with_topics(topics)
 }
 
 /// Hands out a fresh producer id so the default idempotent producer can start.
@@ -667,24 +942,37 @@ pub fn init_producer_id(
         .with_producer_epoch(0)
 }
 
-/// Answers `FindCoordinator`: this node coordinates every group; transactions are not supported.
+/// Answers `FindCoordinator`: the controller coordinates every group; transactions are not
+/// supported.
 pub fn find_coordinator(
     broker: &Broker,
     version: i16,
     request: &FindCoordinatorRequest,
 ) -> FindCoordinatorResponse {
-    let config = &broker.config;
-    let node = BrokerId(config.node_id);
-    let host = StrBytes::from_string(config.advertised_host.clone());
-    let port = i32::from(config.advertised_port);
-    let refused = (request.key_type != GROUP_KEY_TYPE).then(|| {
-        (
+    let cluster = broker.cluster();
+    let coordinator = cluster.controller().and_then(|id| cluster.peer(id));
+    let node = BrokerId(coordinator.map_or(-1, |peer| peer.id));
+    let host = StrBytes::from_string(
+        coordinator
+            .map(|peer| peer.host.clone())
+            .unwrap_or_default(),
+    );
+    let port = coordinator.map_or(-1, |peer| i32::from(peer.port));
+    let refused = if request.key_type != GROUP_KEY_TYPE {
+        Some((
             ResponseError::InvalidRequest.code(),
             Some(StrBytes::from_static_str(
                 "only consumer group coordinators exist",
             )),
-        )
-    });
+        ))
+    } else if coordinator.is_none() {
+        Some((
+            ResponseError::CoordinatorNotAvailable.code(),
+            Some(StrBytes::from_static_str("no controller is elected yet")),
+        ))
+    } else {
+        None
+    };
     if version < 4 {
         let response = FindCoordinatorResponse::default();
         return match refused {
@@ -715,6 +1003,16 @@ pub fn find_coordinator(
     FindCoordinatorResponse::default().with_coordinators(coordinators)
 }
 
+/// The error a member whose join or sync went unanswered gets: the coordinator moved, or it was
+/// removed from the group.
+fn unanswered(broker: &Broker) -> i16 {
+    broker
+        .cluster()
+        .coordinator_check()
+        .err()
+        .unwrap_or(ResponseError::UnknownMemberId.code())
+}
+
 /// Answers `JoinGroup` once the group's join phase completes.
 pub async fn join_group(
     broker: &Broker,
@@ -722,32 +1020,36 @@ pub async fn join_group(
     request: JoinGroupRequest,
     client: ClientInfo,
 ) -> JoinGroupResponse {
+    if let Err(code) = broker.cluster().coordinator_check() {
+        return group::join_error(code, request.member_id, version);
+    }
     let reply = broker
         .groups()
         .join(&request, version, client, Instant::now());
     reply
-        .resolve(|| {
-            group::join_error(
-                ResponseError::UnknownMemberId.code(),
-                request.member_id,
-                version,
-            )
-        })
+        .resolve(|| group::join_error(unanswered(broker), request.member_id, version))
         .await
 }
 
 /// Answers `SyncGroup`; followers wait for the leader's assignment.
 pub async fn sync_group(broker: &Broker, request: &SyncGroupRequest) -> SyncGroupResponse {
+    if let Err(code) = broker.cluster().coordinator_check() {
+        return group::sync_error(code);
+    }
     broker
         .groups()
         .sync(request, Instant::now())
-        .resolve(|| group::sync_error(ResponseError::UnknownMemberId.code()))
+        .resolve(|| group::sync_error(unanswered(broker)))
         .await
 }
 
 /// Answers `Heartbeat`.
 pub fn heartbeat(broker: &Broker, request: &HeartbeatRequest) -> HeartbeatResponse {
-    HeartbeatResponse::default().with_error_code(broker.groups().heartbeat(request, Instant::now()))
+    let code = match broker.cluster().coordinator_check() {
+        Ok(()) => broker.groups().heartbeat(request, Instant::now()),
+        Err(code) => code,
+    };
+    HeartbeatResponse::default().with_error_code(code)
 }
 
 /// Answers `LeaveGroup`: one member before v3, a batch of members from v3.
@@ -756,6 +1058,9 @@ pub fn leave_group(
     version: i16,
     request: &LeaveGroupRequest,
 ) -> LeaveGroupResponse {
+    if let Err(code) = broker.cluster().coordinator_check() {
+        return LeaveGroupResponse::default().with_error_code(code);
+    }
     let ids: Vec<StrBytes> = if version >= 3 {
         request
             .members
@@ -786,18 +1091,22 @@ pub fn leave_group(
     LeaveGroupResponse::default().with_members(members)
 }
 
-/// Answers `OffsetCommit`; offsets are durable before the response is sent.
+/// Answers `OffsetCommit` on the coordinator; offsets are committed to the replicated metadata log
+/// before the response is sent.
 pub async fn offset_commit(broker: &Broker, request: OffsetCommitRequest) -> OffsetCommitResponse {
+    let coordinating = broker.cluster().coordinator_check();
     let mut topics = Vec::with_capacity(request.topics.len());
     let mut offsets = Vec::new();
     let mut accepted = Vec::new();
     for (t, wanted) in request.topics.iter().enumerate() {
-        let topic = broker.topic(&wanted.name);
+        let topic = broker.cluster().topic(&wanted.name);
         let mut partitions = Vec::with_capacity(wanted.partitions.len());
         for (p, partition) in wanted.partitions.iter().enumerate() {
             let index = partition.partition_index;
             let mut response = OffsetCommitResponsePartition::default().with_partition_index(index);
-            if topic.as_ref().is_none_or(|t| t.partition(index).is_none()) {
+            if let Err(code) = coordinating {
+                response.error_code = code;
+            } else if topic.as_ref().is_none_or(|t| t.group(index).is_none()) {
                 response.error_code = ResponseError::UnknownTopicOrPartition.code();
             } else if partition
                 .committed_metadata
@@ -824,15 +1133,25 @@ pub async fn offset_commit(broker: &Broker, request: OffsetCommitRequest) -> Off
                 .with_partitions(partitions),
         );
     }
-    let code = broker
-        .groups()
-        .commit(
-            &request.group_id,
-            &request.member_id,
-            request.generation_id_or_member_epoch,
-            offsets,
-        )
-        .await;
+    if accepted.is_empty() {
+        return OffsetCommitResponse::default().with_topics(topics);
+    }
+    let checked = broker.groups().check_commit(
+        &request.group_id,
+        &request.member_id,
+        request.generation_id_or_member_epoch,
+    );
+    let code = match checked {
+        Ok(()) => match broker
+            .cluster()
+            .commit_offsets(&request.group_id, offsets)
+            .await
+        {
+            Ok(()) => 0,
+            Err(code) => code,
+        },
+        Err(code) => code,
+    };
     for (t, p) in accepted {
         topics[t].partitions[p].error_code = code;
     }
@@ -842,12 +1161,15 @@ pub async fn offset_commit(broker: &Broker, request: OffsetCommitRequest) -> Off
 type WantedOffsets = Option<Vec<(TopicName, Vec<i32>)>>;
 type FoundOffsets = Vec<(TopicName, Vec<(i32, Option<Committed>)>)>;
 
-/// Answers `OffsetFetch`; partitions without a committed offset report offset -1.
-pub async fn offset_fetch(
+/// Answers `OffsetFetch` on the coordinator; partitions without a committed offset report -1.
+pub fn offset_fetch(
     broker: &Broker,
     version: i16,
     request: OffsetFetchRequest,
 ) -> OffsetFetchResponse {
+    if let Err(code) = broker.cluster().coordinator_check() {
+        return offset_fetch_refused(version, request, code);
+    }
     if version < 8 {
         let wanted = request.topics.map(|topics| {
             topics
@@ -856,7 +1178,6 @@ pub async fn offset_fetch(
                 .collect()
         });
         let topics = committed_offsets(broker, &request.group_id, wanted)
-            .await
             .into_iter()
             .map(|(name, partitions)| {
                 let partitions = partitions
@@ -886,7 +1207,6 @@ pub async fn offset_fetch(
                 .collect()
         });
         let topics = committed_offsets(broker, &wanted_group.group_id, wanted)
-            .await
             .into_iter()
             .map(|(name, partitions)| {
                 let partitions = partitions
@@ -914,13 +1234,52 @@ pub async fn offset_fetch(
     OffsetFetchResponse::default().with_groups(groups)
 }
 
+/// `OffsetFetch` answered with `code` everywhere it can carry one.
+fn offset_fetch_refused(
+    version: i16,
+    request: OffsetFetchRequest,
+    code: i16,
+) -> OffsetFetchResponse {
+    if version >= 8 {
+        let groups = request
+            .groups
+            .into_iter()
+            .map(|g| {
+                OffsetFetchResponseGroup::default()
+                    .with_group_id(g.group_id)
+                    .with_error_code(code)
+            })
+            .collect();
+        return OffsetFetchResponse::default().with_groups(groups);
+    }
+    let topics = request
+        .topics
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| {
+            let partitions = t
+                .partition_indexes
+                .iter()
+                .map(|&index| {
+                    OffsetFetchResponsePartition::default()
+                        .with_partition_index(index)
+                        .with_committed_offset(-1)
+                        .with_error_code(code)
+                })
+                .collect();
+            OffsetFetchResponseTopic::default()
+                .with_name(t.name)
+                .with_partitions(partitions)
+        })
+        .collect();
+    OffsetFetchResponse::default()
+        .with_error_code(code)
+        .with_topics(topics)
+}
+
 /// The group's committed offsets for `wanted` partitions, or for every committed partition.
-async fn committed_offsets(
-    broker: &Broker,
-    group: &GroupId,
-    wanted: WantedOffsets,
-) -> FoundOffsets {
-    let offsets = broker.groups().committed(group).await;
+fn committed_offsets(broker: &Broker, group: &GroupId, wanted: WantedOffsets) -> FoundOffsets {
+    let offsets = broker.cluster().committed(group);
     if let Some(topics) = wanted {
         return topics
             .into_iter()
@@ -957,34 +1316,54 @@ pub fn describe_groups(
     version: i16,
     request: &DescribeGroupsRequest,
 ) -> DescribeGroupsResponse {
+    let coordinating = broker.cluster().coordinator_check();
     let groups = request
         .groups
         .iter()
         .map(|id| {
-            broker.groups().describe(id).unwrap_or_else(|| {
-                let dead = DescribedGroup::default()
+            if let Err(code) = coordinating {
+                return DescribedGroup::default()
                     .with_group_id(id.clone())
-                    .with_group_state(StrBytes::from_static_str("Dead"));
-                if version >= 6 {
-                    dead.with_error_code(ResponseError::GroupIdNotFound.code())
-                        .with_error_message(Some(StrBytes::from_static_str("group does not exist")))
-                } else {
-                    dead
-                }
-            })
+                    .with_error_code(code);
+            }
+            let has_offsets = broker.cluster().has_offsets(id);
+            broker
+                .groups()
+                .describe(id, has_offsets)
+                .unwrap_or_else(|| {
+                    let dead = DescribedGroup::default()
+                        .with_group_id(id.clone())
+                        .with_group_state(StrBytes::from_static_str("Dead"));
+                    if version >= 6 {
+                        dead.with_error_code(ResponseError::GroupIdNotFound.code())
+                            .with_error_message(Some(StrBytes::from_static_str(
+                                "group does not exist",
+                            )))
+                    } else {
+                        dead
+                    }
+                })
         })
         .collect();
     DescribeGroupsResponse::default().with_groups(groups)
 }
 
-/// Answers `ListGroups`, honouring the state and type filters.
+/// Answers `ListGroups`, honouring the state and type filters. Clients ask every broker; only the
+/// coordinator has groups to list.
 pub fn list_groups(broker: &Broker, request: &ListGroupsRequest) -> ListGroupsResponse {
+    match broker.cluster().coordinator_check() {
+        Ok(()) => {}
+        Err(code) if code == ResponseError::NotCoordinator.code() => {
+            return ListGroupsResponse::default();
+        }
+        Err(code) => return ListGroupsResponse::default().with_error_code(code),
+    }
     let wanted = |filter: &[StrBytes], value: &StrBytes| {
         filter.is_empty() || filter.iter().any(|f| f.eq_ignore_ascii_case(value))
     };
     let groups = broker
         .groups()
-        .list()
+        .list(&broker.cluster().groups_with_offsets())
         .into_iter()
         .filter(|g| {
             wanted(&request.states_filter, &g.group_state)
@@ -1007,7 +1386,7 @@ pub fn describe_configs(
                 .with_resource_type(resource.resource_type)
                 .with_resource_name(resource.resource_name.clone());
             let error = match resource.resource_type {
-                TOPIC_RESOURCE if broker.topic(&resource.resource_name).is_none() => {
+                TOPIC_RESOURCE if broker.cluster().topic(&resource.resource_name).is_none() => {
                     Some(ResponseError::UnknownTopicOrPartition)
                 }
                 // ponytail: no topic or broker configs exist yet, so every entry list is empty.
@@ -1029,8 +1408,9 @@ fn topic_name(name: &str) -> TopicName {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use bytes::BytesMut;
     use kafka_protocol::indexmap::IndexMap;
+    use kafka_protocol::messages::fetch_response::AbortedTransaction;
+    use kafka_protocol::protocol::Encodable;
     use kafka_protocol::records::{
         Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
     };
@@ -1143,9 +1523,10 @@ pub(crate) mod tests {
         assert_eq!(
             keys,
             [
-                0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 22, 32
+                0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 22, 23, 32
             ]
         );
+        assert!(supports(ApiKey::OffsetForLeaderEpoch, 4));
         assert!(supports(ApiKey::Fetch, 18));
         assert!(!supports(ApiKey::ListOffsets, 7));
         assert!(supports(ApiKey::FindCoordinator, 6));
@@ -1165,5 +1546,83 @@ pub(crate) mod tests {
         );
         assert!(unsupported(ApiKey::AlterConfigs, 0).is_none());
         assert!(unsupported(ApiKey::ConsumerGroupHeartbeat, 99).is_none());
+    }
+
+    fn fetch_response(version: i16) -> FetchResponse {
+        let partition = |index, records: Option<Bytes>| {
+            PartitionData::default()
+                .with_partition_index(index)
+                .with_high_watermark(1000 + i64::from(index))
+                .with_last_stable_offset(900)
+                .with_log_start_offset(3)
+                .with_records(records)
+        };
+        let topic = |name: &'static str, id, partitions| {
+            FetchableTopicResponse::default()
+                .with_topic(TopicName(StrBytes::from_static_str(name)))
+                .with_topic_id(Uuid::from_u128(id))
+                .with_partitions(partitions)
+        };
+        FetchResponse::default()
+            .with_throttle_time_ms(7)
+            .with_error_code(if version >= 7 { 3 } else { 0 })
+            .with_responses(vec![
+                topic(
+                    "orders",
+                    1,
+                    vec![
+                        partition(0, Some(Bytes::from(vec![1; 300]))),
+                        partition(1, Some(Bytes::new())),
+                        partition(2, None),
+                        partition(3, Some(Bytes::new())).with_error_code(1),
+                        partition(4, Some(Bytes::from(vec![2; 70_000]))),
+                    ],
+                ),
+                topic("empty", 2, Vec::new()),
+                topic(
+                    "events",
+                    3,
+                    vec![partition(0, Some(Bytes::from(vec![3; 5])))],
+                ),
+            ])
+    }
+
+    #[test]
+    fn encode_fetch_matches_generic_encoding_at_every_version() {
+        for version in 4..=18 {
+            let response = fetch_response(version);
+            let records: Vec<_> = response
+                .responses
+                .iter()
+                .flat_map(|t| &t.partitions)
+                .map(|p| p.records.clone())
+                .collect();
+            let lengths: Vec<_> = records.iter().map(|r| r.as_ref().map(Bytes::len)).collect();
+            let mut head = BytesMut::new();
+            let positions = encode_fetch(&response, version, &lengths, &mut head).unwrap();
+
+            let (mut split, mut from) = (Vec::new(), 0);
+            for (at, records) in positions.into_iter().zip(&records) {
+                split.extend_from_slice(&head[from..at]);
+                split.extend_from_slice(records.as_deref().unwrap_or_default());
+                from = at;
+            }
+            split.extend_from_slice(&head[from..]);
+            let mut generic = BytesMut::new();
+            response.encode(&mut generic, version).unwrap();
+            assert_eq!(split, generic, "Fetch v{version}");
+        }
+    }
+
+    #[test]
+    fn encode_fetch_refuses_fields_it_leaves_out() {
+        let mut response = fetch_response(12);
+        response.responses[0].partitions[0].aborted_transactions =
+            Some(vec![AbortedTransaction::default()]);
+        let lengths = [Some(0); 6];
+        assert!(encode_fetch(&response, 12, &lengths, &mut BytesMut::new()).is_err());
+        assert!(
+            encode_fetch(&fetch_response(12), 12, &lengths[..5], &mut BytesMut::new()).is_err()
+        );
     }
 }

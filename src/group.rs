@@ -1,15 +1,12 @@
-//! Classic consumer-group coordinator: membership, rebalances and durably committed offsets.
+//! Classic consumer-group coordinator: membership and rebalances.
 //!
-//! This node coordinates every group. Membership lives in memory only, so after a restart members
-//! simply rejoin; committed offsets are fsynced to the data dir before a commit is acknowledged.
+//! The controller coordinates every group. Membership lives in memory only, so after a restart or
+//! a controller change members simply rejoin; committed offsets live in the replicated metadata log
+//! (see [`crate::cluster`]).
 
 use std::collections::{BTreeMap, HashMap};
-use std::fmt::Write as _;
-use std::fs::{self, File};
-use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -25,12 +22,10 @@ use kafka_protocol::messages::{
 use kafka_protocol::protocol::StrBytes;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
-use tracing::{error, info, warn};
+use tracing::info;
 use uuid::Uuid;
 
-use crate::broker::replace_file;
-
-/// Longest group id accepted: committed offsets live in a file named after the hex-encoded id.
+/// Longest group id accepted.
 pub const MAX_GROUP_ID_BYTES: usize = 120;
 const MAX_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CLASSIC: &str = "classic";
@@ -390,22 +385,17 @@ impl Group {
     }
 }
 
-/// Coordinator of every group: in-memory membership plus the durable offset store.
+/// Coordinator of every group's membership.
+#[derive(Default)]
 pub struct Coordinator {
     groups: Mutex<HashMap<StrBytes, Group>>,
-    offsets: OffsetStore,
 }
 
 impl Coordinator {
-    /// Opens the coordinator, loading committed offsets from `dir`. Blocking.
-    ///
-    /// # Errors
-    /// Fails when the directory cannot be created or an offsets file cannot be read.
-    pub fn open(dir: PathBuf) -> io::Result<Coordinator> {
-        Ok(Coordinator {
-            groups: Mutex::new(HashMap::new()),
-            offsets: OffsetStore::open(dir)?,
-        })
+    /// Forgets every group's membership, as when this node stops or starts coordinating; members
+    /// still waiting for a join or sync answer get none and rejoin.
+    pub fn reset(&self) {
+        lock(&self.groups).clear();
     }
 
     /// Handles `JoinGroup`: hands out member ids, starts rebalances and answers once the join
@@ -652,40 +642,13 @@ impl Coordinator {
         }
     }
 
-    /// Durably records `offsets` once [`Coordinator::check_commit`] passes; returns the error code.
-    pub async fn commit(
-        &self,
-        group_id: &StrBytes,
-        member_id: &StrBytes,
-        generation: i32,
-        offsets: Vec<((StrBytes, i32), Committed)>,
-    ) -> i16 {
-        if let Err(code) = self.check_commit(group_id, member_id, generation) {
-            return code;
-        }
-        if offsets.is_empty() {
-            return 0;
-        }
-        match self.offsets.save(group_id, offsets).await {
-            Ok(()) => 0,
-            Err(e) => {
-                error!(group = %group_id, "committing offsets failed: {e}");
-                ResponseError::CoordinatorNotAvailable.code()
-            }
-        }
-    }
-
-    /// The group's committed offsets.
-    pub async fn committed(&self, group_id: &StrBytes) -> Offsets {
-        self.offsets.load(group_id).await
-    }
-
-    /// The group as `DescribeGroups` shows it, or `None` if it has neither members nor offsets.
-    pub fn describe(&self, group_id: &StrBytes) -> Option<DescribedGroup> {
+    /// The group as `DescribeGroups` shows it, or `None` if it has neither members nor offsets
+    /// (`has_offsets`).
+    pub fn describe(&self, group_id: &StrBytes, has_offsets: bool) -> Option<DescribedGroup> {
         let groups = lock(&self.groups);
         let described = DescribedGroup::default().with_group_id(GroupId(group_id.clone()));
         let Some(group) = groups.get(group_id) else {
-            return self.offsets.contains(group_id).then(|| {
+            return has_offsets.then(|| {
                 described.with_group_state(StrBytes::from_static_str(State::Empty.name()))
             });
         };
@@ -723,8 +686,8 @@ impl Coordinator {
         )
     }
 
-    /// Every group with members or committed offsets.
-    pub fn list(&self) -> Vec<ListedGroup> {
+    /// Every group with members, and every group in `with_offsets`.
+    pub fn list(&self, with_offsets: &[StrBytes]) -> Vec<ListedGroup> {
         let groups = lock(&self.groups);
         let listed = |id: &StrBytes, state: State, protocol_type: Option<&StrBytes>| {
             ListedGroup::default()
@@ -738,8 +701,7 @@ impl Coordinator {
             .map(|g| listed(&g.id, g.state, g.protocol_type.as_ref()))
             .collect();
         all.extend(
-            self.offsets
-                .group_ids()
+            with_offsets
                 .iter()
                 .filter(|id| !groups.contains_key(*id))
                 .map(|id| listed(id, State::Empty, None)),
@@ -771,162 +733,6 @@ fn millis(ms: i32) -> Option<Duration> {
         .ok()
         .filter(|ms| *ms > 0)
         .map(Duration::from_millis)
-}
-
-// ponytail: one fsynced, atomically replaced file per group, rewritten whole on every commit; cost
-// grows with the group's partition count. Moves onto the replicated log in a later milestone.
-struct OffsetStore {
-    dir: PathBuf,
-    groups: Mutex<HashMap<StrBytes, Arc<tokio::sync::Mutex<Offsets>>>>,
-}
-
-impl OffsetStore {
-    fn open(dir: PathBuf) -> io::Result<OffsetStore> {
-        if !dir.is_dir() {
-            fs::create_dir_all(&dir)?;
-            if let Some(parent) = dir.parent() {
-                File::open(parent)?.sync_all()?;
-            }
-        }
-        let mut groups = HashMap::new();
-        for entry in fs::read_dir(&dir)? {
-            let path = entry?.path();
-            if path.extension().is_some_and(|e| e == "tmp") {
-                fs::remove_file(&path)?;
-                continue;
-            }
-            let group = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(unhex)
-                .and_then(|id| String::from_utf8(id).ok());
-            let Some(group) = group else {
-                warn!(?path, "ignoring unexpected file in groups dir");
-                continue;
-            };
-            let offsets = parse_offsets(&fs::read_to_string(&path)?)?;
-            info!(%group, partitions = offsets.len(), "loaded committed offsets");
-            groups.insert(
-                StrBytes::from_string(group),
-                Arc::new(tokio::sync::Mutex::new(offsets)),
-            );
-        }
-        Ok(OffsetStore {
-            dir,
-            groups: Mutex::new(groups),
-        })
-    }
-
-    /// Merges `entries` into the group's offsets and makes them durable. The write and the
-    /// in-memory update happen on one blocking task, so a dropped caller cannot leave them apart.
-    async fn save(
-        &self,
-        group: &StrBytes,
-        entries: Vec<((StrBytes, i32), Committed)>,
-    ) -> io::Result<()> {
-        let slot = Arc::clone(lock(&self.groups).entry(group.clone()).or_default());
-        let mut offsets = slot.lock_owned().await;
-        let dir = self.dir.clone();
-        let name = hex(group.as_bytes());
-        tokio::task::spawn_blocking(move || {
-            let mut next = offsets.clone();
-            next.extend(entries);
-            replace_file(&dir, &name, render_offsets(&next).as_bytes())?;
-            *offsets = next;
-            Ok(())
-        })
-        .await
-        .map_err(io::Error::other)?
-    }
-
-    async fn load(&self, group: &StrBytes) -> Offsets {
-        let slot = lock(&self.groups).get(group).cloned();
-        match slot {
-            Some(slot) => slot.lock().await.clone(),
-            None => Offsets::new(),
-        }
-    }
-
-    fn contains(&self, group: &StrBytes) -> bool {
-        lock(&self.groups).contains_key(group)
-    }
-
-    fn group_ids(&self) -> Vec<StrBytes> {
-        lock(&self.groups).keys().cloned().collect()
-    }
-}
-
-/// One line per partition: topic, partition, offset, leader epoch, hex metadata or `-` for null.
-fn render_offsets(offsets: &Offsets) -> String {
-    let mut text = String::new();
-    for ((topic, partition), committed) in offsets {
-        let metadata = committed
-            .metadata
-            .as_ref()
-            .map_or_else(|| "-".to_owned(), |m| hex(m.as_bytes()));
-        let _ = writeln!(
-            text,
-            "{topic}\t{partition}\t{}\t{}\t{metadata}",
-            committed.offset, committed.leader_epoch
-        );
-    }
-    text
-}
-
-fn parse_offsets(text: &str) -> io::Result<Offsets> {
-    text.lines()
-        .map(|line| {
-            parse_offset(line).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("bad line in offsets file: {line:?}"),
-                )
-            })
-        })
-        .collect()
-}
-
-fn parse_offset(line: &str) -> Option<((StrBytes, i32), Committed)> {
-    let fields: Vec<&str> = line.split('\t').collect();
-    let [topic, partition, offset, leader_epoch, metadata] = fields[..] else {
-        return None;
-    };
-    let metadata = match metadata {
-        "-" => None,
-        hexed => Some(StrBytes::from_string(
-            String::from_utf8(unhex(hexed)?).ok()?,
-        )),
-    };
-    Some((
-        (
-            StrBytes::from_string(topic.to_owned()),
-            partition.parse().ok()?,
-        ),
-        Committed {
-            offset: offset.parse().ok()?,
-            leader_epoch: leader_epoch.parse().ok()?,
-            metadata,
-        },
-    ))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut text, b| {
-            let _ = write!(text, "{b:02x}");
-            text
-        })
-}
-
-fn unhex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
-        .collect()
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -970,12 +776,6 @@ mod tests {
             id: s("client"),
             host: s("/127.0.0.1"),
         }
-    }
-
-    fn coordinator() -> (tempfile::TempDir, Coordinator) {
-        let dir = tempfile::tempdir().unwrap();
-        let coordinator = Coordinator::open(dir.path().join("groups")).unwrap();
-        (dir, coordinator)
     }
 
     fn ready<T>(reply: Reply<T>) -> T {
@@ -1046,7 +846,7 @@ mod tests {
     }
 
     fn state(coordinator: &Coordinator) -> Option<StrBytes> {
-        coordinator.describe(&s("g")).map(|g| g.group_state)
+        coordinator.describe(&s("g"), false).map(|g| g.group_state)
     }
 
     /// A stable two-member group at generation 2 with `a` leading.
@@ -1068,7 +868,7 @@ mod tests {
 
     #[test]
     fn join_requires_member_id_then_single_member_leads() {
-        let (_dir, coordinator) = coordinator();
+        let coordinator = Coordinator::default();
         let now = Instant::now();
         let (id, joined) = new_member(&coordinator, &["range", "cooperative-sticky"], now);
         let joined = ready(joined);
@@ -1090,7 +890,7 @@ mod tests {
 
     #[test]
     fn join_rejects_unknown_member_and_bad_timeouts() {
-        let (_dir, coordinator) = coordinator();
+        let coordinator = Coordinator::default();
         let now = Instant::now();
         let unknown = ready(coordinator.join(&request(&s("ghost"), &["range"]), 9, client(), now));
         assert_eq!(unknown.error_code, ResponseError::UnknownMemberId.code());
@@ -1108,7 +908,7 @@ mod tests {
 
     #[test]
     fn join_before_v4_assigns_member_id_directly() {
-        let (_dir, coordinator) = coordinator();
+        let coordinator = Coordinator::default();
         let joined =
             ready(coordinator.join(&request(&s(""), &["range"]), 3, client(), Instant::now()));
         assert_eq!(joined.error_code, 0);
@@ -1118,7 +918,7 @@ mod tests {
 
     #[test]
     fn join_waits_for_every_member_and_followers_wait_for_assignment() {
-        let (_dir, coordinator) = coordinator();
+        let coordinator = Coordinator::default();
         let now = Instant::now();
         let (a, joined) = new_member(&coordinator, &["range"], now);
         ready(joined);
@@ -1157,7 +957,7 @@ mod tests {
 
     #[test]
     fn heartbeat_checks_group_member_and_generation() {
-        let (_dir, coordinator) = coordinator();
+        let coordinator = Coordinator::default();
         let now = Instant::now();
         let unknown = ResponseError::UnknownMemberId.code();
         assert_eq!(heartbeat(&coordinator, &s("nobody"), 0, now), unknown);
@@ -1173,7 +973,7 @@ mod tests {
 
     #[test]
     fn session_expiry_removes_silent_member_and_rebalances() {
-        let (_dir, coordinator) = coordinator();
+        let coordinator = Coordinator::default();
         let start = Instant::now();
         let (a, b) = stable_pair(&coordinator, start);
         let later = start + SESSION / 2;
@@ -1199,7 +999,7 @@ mod tests {
 
     #[test]
     fn member_waiting_on_join_is_not_session_expired() {
-        let (_dir, coordinator) = coordinator();
+        let coordinator = Coordinator::default();
         let now = Instant::now();
         let (a, b) = stable_pair(&coordinator, now);
         let (_, c_joined) = new_member(&coordinator, &["range"], now);
@@ -1221,7 +1021,7 @@ mod tests {
 
     #[test]
     fn rebalance_timeout_drops_members_that_do_not_rejoin() {
-        let (_dir, coordinator) = coordinator();
+        let coordinator = Coordinator::default();
         let now = Instant::now();
         let (a, b) = stable_pair(&coordinator, now);
         let (c, c_joined) = new_member(&coordinator, &["range"], now);
@@ -1251,7 +1051,7 @@ mod tests {
 
     #[test]
     fn leave_rebalances_and_last_leave_empties_group() {
-        let (_dir, coordinator) = coordinator();
+        let coordinator = Coordinator::default();
         let now = Instant::now();
         let (a, b) = stable_pair(&coordinator, now);
         assert_eq!(
@@ -1278,7 +1078,7 @@ mod tests {
 
     #[test]
     fn sync_checks_generation_and_rebalance_state() {
-        let (_dir, coordinator) = coordinator();
+        let coordinator = Coordinator::default();
         let now = Instant::now();
         let (a, b) = stable_pair(&coordinator, now);
         assert_eq!(
@@ -1303,7 +1103,7 @@ mod tests {
 
     #[test]
     fn protocol_selection_needs_a_protocol_every_member_supports() {
-        let (_dir, coordinator) = coordinator();
+        let coordinator = Coordinator::default();
         let now = Instant::now();
         let (a, joined) = new_member(&coordinator, &["range", "roundrobin"], now);
         ready(joined);
@@ -1344,7 +1144,7 @@ mod tests {
 
     #[test]
     fn pending_member_ids_delay_join_until_they_expire() {
-        let (_dir, coordinator) = coordinator();
+        let coordinator = Coordinator::default();
         let now = Instant::now();
         let first = ready(coordinator.join(&request(&s(""), &["range"]), 9, client(), now));
         let _second = ready(coordinator.join(&request(&s(""), &["range"]), 9, client(), now));
@@ -1360,7 +1160,7 @@ mod tests {
 
     #[test]
     fn commit_checks_membership_generation_and_state() {
-        let (_dir, coordinator) = coordinator();
+        let coordinator = Coordinator::default();
         let now = Instant::now();
         let g = s("g");
         assert_eq!(
@@ -1393,51 +1193,5 @@ mod tests {
             coordinator.check_commit(&s(""), &s(""), -1),
             Err(ResponseError::InvalidGroupId.code())
         );
-    }
-
-    #[tokio::test]
-    async fn committed_offsets_survive_reopen() {
-        let (dir, coordinator) = coordinator();
-        let group = s("weird/group id\twith ü");
-        let committed = |offset, metadata: Option<&str>| Committed {
-            offset,
-            leader_epoch: 4,
-            metadata: metadata.map(s),
-        };
-        let first = vec![
-            ((s("orders"), 0), committed(10, Some(""))),
-            ((s("orders"), 1), committed(20, None)),
-        ];
-        assert_eq!(coordinator.commit(&group, &s(""), -1, first).await, 0);
-        let second = vec![((s("orders"), 1), committed(25, Some("tab\there\nnewline")))];
-        assert_eq!(coordinator.commit(&group, &s(""), -1, second).await, 0);
-        let expected = coordinator.committed(&group).await;
-        assert_eq!(expected.len(), 2);
-        assert_eq!(
-            expected[&(s("orders"), 1)],
-            committed(25, Some("tab\there\nnewline"))
-        );
-        drop(coordinator);
-
-        std::fs::write(dir.path().join("groups").join("abcd.tmp"), "torn").unwrap();
-        let reopened = Coordinator::open(dir.path().join("groups")).unwrap();
-        assert_eq!(reopened.committed(&group).await, expected);
-        assert!(reopened.committed(&s("other")).await.is_empty());
-        assert_eq!(
-            reopened.describe(&group).map(|g| g.group_state),
-            Some(s("Empty")),
-            "a group with offsets but no members is described as empty"
-        );
-        assert_eq!(reopened.list().len(), 1);
-        assert!(!dir.path().join("groups").join("abcd.tmp").exists());
-    }
-
-    #[test]
-    fn hex_round_trips_and_rejects_garbage() {
-        assert_eq!(hex(b"g-1"), "672d31");
-        assert_eq!(unhex("672d31"), Some(b"g-1".to_vec()));
-        assert_eq!(unhex("672"), None);
-        assert_eq!(unhex("+f"), None);
-        assert_eq!(unhex("zz"), None);
     }
 }

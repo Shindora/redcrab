@@ -76,22 +76,38 @@ impl Client {
     }
 }
 
-fn start(dir: &Path) -> (u16, JoinHandle<()>) {
+/// A single-node broker serving on a local port.
+struct Server {
+    broker: Arc<Broker>,
+    serving: JoinHandle<()>,
+}
+
+impl Server {
+    async fn stop(self) {
+        self.serving.abort();
+        self.broker.shutdown().await;
+    }
+}
+
+async fn start(dir: &Path) -> (u16, Server) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
-    let broker = Broker::open(BrokerConfig {
-        node_id: 0,
-        advertised_host: "127.0.0.1".into(),
-        advertised_port: port,
-        data_dir: dir.to_path_buf(),
-    })
+    let broker = Broker::start(
+        BrokerConfig {
+            node_id: 0,
+            advertised_host: "127.0.0.1".into(),
+            advertised_port: port,
+            data_dir: dir.to_path_buf(),
+            peers: Vec::new(),
+        },
+        None,
+    )
+    .await
     .unwrap();
     let listener = TcpListener::from_std(listener).unwrap();
-    (
-        port,
-        tokio::spawn(redcrab::serve(listener, Arc::new(broker))),
-    )
+    let serving = tokio::spawn(redcrab::serve(listener, Arc::clone(&broker)));
+    (port, Server { broker, serving })
 }
 
 fn batch(values: &[&str]) -> Bytes {
@@ -185,6 +201,7 @@ fn values(partition: &PartitionData) -> Vec<(i64, String)> {
         .unwrap()
         .into_iter()
         .flat_map(|set| set.records)
+        .filter(|r| !r.control)
         .map(|r| {
             (
                 r.offset,
@@ -197,7 +214,7 @@ fn values(partition: &PartitionData) -> Vec<(i64, String)> {
 #[tokio::test(flavor = "multi_thread")]
 async fn produce_fetch_roundtrip_by_id_and_name() {
     let dir = tempfile::tempdir().unwrap();
-    let (port, _server) = start(dir.path());
+    let (port, _server) = start(dir.path()).await;
     let mut client = Client::connect(port).await;
     assert_eq!(
         client
@@ -211,7 +228,11 @@ async fn produce_fetch_roundtrip_by_id_and_name() {
     let two_batches = [batch(&["a", "b"]), batch(&["c"])].concat();
     let produced = produce_by_id(&mut client, topic_id, 1, Bytes::from(two_batches)).await;
     let partition = &produced.responses[0].partition_responses[0];
-    assert_eq!((partition.error_code, partition.base_offset), (0, 0));
+    assert_eq!(
+        (partition.error_code, partition.base_offset),
+        (0, 1),
+        "the leader's no-op takes offset 0"
+    );
 
     let by_name = ProduceRequest::default()
         .with_acks(1)
@@ -227,13 +248,19 @@ async fn produce_fetch_roundtrip_by_id_and_name() {
         ]);
     let produced = client.call(&by_name, 9).await;
     let partition = &produced.responses[0].partition_responses[0];
-    assert_eq!((partition.error_code, partition.base_offset), (0, 3));
+    assert_eq!((partition.error_code, partition.base_offset), (0, 4));
 
-    let fetched = client.call(&fetch_by_id(topic_id, 1, 1, 0), 18).await;
+    let fetched = client.call(&fetch_by_id(topic_id, 1, 2, 0), 18).await;
     let partition = &fetched.responses[0].partitions[0];
-    assert_eq!((partition.error_code, partition.high_watermark), (0, 4));
-    let expected = [(0, "a"), (1, "b"), (2, "c"), (3, "d")].map(|(o, v)| (o, v.to_owned()));
+    assert_eq!((partition.error_code, partition.high_watermark), (0, 5));
+    let expected = [(1, "a"), (2, "b"), (3, "c"), (4, "d")].map(|(o, v)| (o, v.to_owned()));
     assert_eq!(values(partition), expected);
+    let fetched = client.call(&fetch_by_id(topic_id, 1, 0, 0), 18).await;
+    assert_eq!(
+        values(&fetched.responses[0].partitions[0]),
+        expected,
+        "consumers skip the no-op"
+    );
 
     let fetched = client.call(&fetch_by_id(topic_id, 1, 9, 0), 18).await;
     assert_eq!(
@@ -248,9 +275,66 @@ async fn produce_fetch_roundtrip_by_id_and_name() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn fetch_across_partitions_honours_byte_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, _server) = start(dir.path()).await;
+    let mut client = Client::connect(port).await;
+    let topic_id = create_topic(&mut client, "limits", 3).await;
+    let value = "v".repeat(1000);
+    let one = batch(&[value.as_str()]);
+    for partition in 0..3 {
+        let records = Bytes::from([one.clone(), one.clone(), one.clone()].concat());
+        produce_by_id(&mut client, topic_id, partition, records).await;
+    }
+    let fetch = |max_bytes: usize, partition_max_bytes: usize| {
+        let partitions = (0..3)
+            .map(|p| {
+                FetchPartition::default()
+                    .with_partition(p)
+                    .with_fetch_offset(1)
+                    .with_partition_max_bytes(i32::try_from(partition_max_bytes).unwrap())
+            })
+            .collect();
+        FetchRequest::default()
+            .with_max_bytes(i32::try_from(max_bytes).unwrap())
+            .with_topics(vec![
+                FetchTopic::default()
+                    .with_topic(topic_name("limits"))
+                    .with_topic_id(topic_id)
+                    .with_partitions(partitions),
+            ])
+    };
+    let counts = |response: &kafka_protocol::messages::FetchResponse| -> Vec<usize> {
+        response.responses[0]
+            .partitions
+            .iter()
+            .map(|p| {
+                assert_eq!((p.error_code, p.high_watermark), (0, 4));
+                values(p).len()
+            })
+            .collect()
+    };
+
+    let all = client.call(&fetch(1 << 20, 1 << 20), 18).await;
+    assert_eq!(counts(&all), [3, 3, 3]);
+    let per_partition = client.call(&fetch(1 << 20, 2 * one.len()), 18).await;
+    assert_eq!(counts(&per_partition), [2, 2, 2]);
+    let response_limit = client.call(&fetch(4 * one.len(), 1 << 20), 18).await;
+    assert_eq!(counts(&response_limit), [3, 1, 0]);
+    let first_only = client.call(&fetch(1, 1), 18).await;
+    assert_eq!(
+        counts(&first_only),
+        [1, 0, 0],
+        "only the first partition may exceed the limits, by one batch"
+    );
+    let old_version = client.call(&fetch(4 * one.len(), 1 << 20), 4).await;
+    assert_eq!(counts(&old_version), [3, 1, 0]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn fetch_long_poll_wakes_on_new_data() {
     let dir = tempfile::tempdir().unwrap();
-    let (port, _server) = start(dir.path());
+    let (port, _server) = start(dir.path()).await;
     let mut producer = Client::connect(port).await;
     let topic_id = create_topic(&mut producer, "waits", 1).await;
 
@@ -258,7 +342,7 @@ async fn fetch_long_poll_wakes_on_new_data() {
     let started = Instant::now();
     let waiting = tokio::spawn(async move {
         consumer
-            .call(&fetch_by_id(topic_id, 0, 0, 10_000), 18)
+            .call(&fetch_by_id(topic_id, 0, 1, 10_000), 18)
             .await
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -275,26 +359,26 @@ async fn fetch_long_poll_wakes_on_new_data() {
     );
     assert_eq!(
         values(&fetched.responses[0].partitions[0]),
-        [(0, "late".to_owned())]
+        [(1, "late".to_owned())]
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn restart_keeps_topics_and_data() {
     let dir = tempfile::tempdir().unwrap();
-    let (port, server) = start(dir.path());
+    let (port, server) = start(dir.path()).await;
     let mut client = Client::connect(port).await;
     let topic_id = create_topic(&mut client, "durable", 1).await;
     produce_by_id(&mut client, topic_id, 0, batch(&["survives"])).await;
     drop(client);
-    server.abort();
+    server.stop().await;
 
-    let (port, _server) = start(dir.path());
+    let (port, _server) = start(dir.path()).await;
     let mut client = Client::connect(port).await;
     let fetched = client.call(&fetch_by_id(topic_id, 0, 0, 0), 18).await;
     assert_eq!(
         values(&fetched.responses[0].partitions[0]),
-        [(0, "survives".to_owned())]
+        [(1, "survives".to_owned())]
     );
 }
 
@@ -431,7 +515,7 @@ async fn fetch_offsets(
 #[tokio::test(flavor = "multi_thread")]
 async fn consumer_group_joins_syncs_commits_and_leaves() {
     let dir = tempfile::tempdir().unwrap();
-    let (port, _server) = start(dir.path());
+    let (port, _server) = start(dir.path()).await;
     let mut client = Client::connect(port).await;
     create_topic(&mut client, "orders", 2).await;
 
@@ -531,7 +615,7 @@ async fn consumer_group_joins_syncs_commits_and_leaves() {
 #[tokio::test(flavor = "multi_thread")]
 async fn consumer_group_rebalances_on_join_and_session_expiry() {
     let dir = tempfile::tempdir().unwrap();
-    let (port, _server) = start(dir.path());
+    let (port, _server) = start(dir.path()).await;
     let mut a = Client::connect(port).await;
     let a_joined = join_new(&mut a, "g", 10_000).await;
     sync(&mut a, "g", &a_joined, &[(&a_joined.member_id, b"all")]).await;
@@ -592,7 +676,7 @@ async fn consumer_group_rebalances_on_join_and_session_expiry() {
 #[tokio::test(flavor = "multi_thread")]
 async fn committed_offsets_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let (port, server) = start(dir.path());
+    let (port, server) = start(dir.path()).await;
     let mut client = Client::connect(port).await;
     create_topic(&mut client, "kept", 2).await;
     let committed = client
@@ -605,9 +689,9 @@ async fn committed_offsets_survive_restart() {
             .all(|p| p.error_code == 0)
     );
     drop(client);
-    server.abort();
+    server.stop().await;
 
-    let (port, _server) = start(dir.path());
+    let (port, _server) = start(dir.path()).await;
     let mut client = Client::connect(port).await;
     assert_eq!(
         fetch_offsets(&mut client, "idle", "kept").await,
@@ -639,7 +723,7 @@ async fn committed_offsets_survive_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn group_apis_answer_at_oldest_versions() {
     let dir = tempfile::tempdir().unwrap();
-    let (port, _server) = start(dir.path());
+    let (port, _server) = start(dir.path()).await;
     let mut client = Client::connect(port).await;
     create_topic(&mut client, "old", 1).await;
 
@@ -736,7 +820,7 @@ async fn group_apis_answer_at_oldest_versions() {
 #[tokio::test(flavor = "multi_thread")]
 async fn absurd_array_count_closes_connection_and_broker_stays_up() {
     let dir = tempfile::tempdir().unwrap();
-    let (port, _server) = start(dir.path());
+    let (port, _server) = start(dir.path()).await;
     let crafted: [(i16, &[u8]); 2] = [
         (12, &[0xff, 0xff, 0xff, 0xff, 0x0f]),
         (1, &i32::MAX.to_be_bytes()),
@@ -775,7 +859,7 @@ async fn absurd_array_count_closes_connection_and_broker_stays_up() {
 #[tokio::test(flavor = "multi_thread")]
 async fn describe_configs_answers_known_topics_and_this_broker() {
     let dir = tempfile::tempdir().unwrap();
-    let (port, _server) = start(dir.path());
+    let (port, _server) = start(dir.path()).await;
     let mut client = Client::connect(port).await;
     create_topic(&mut client, "configured", 1).await;
     let resource = |resource_type, name| {

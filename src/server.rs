@@ -2,7 +2,7 @@
 
 use std::fmt::Display;
 use std::future::{Future, ready};
-use std::io;
+use std::io::{self, IoSlice};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use std::time::Duration;
 use bytes::{BufMut, Bytes, BytesMut};
 use kafka_protocol::messages::{ApiKey, RequestKind, ResponseHeader, ResponseKind};
 use kafka_protocol::protocol::{Encodable, decode_request_header_from_buffer};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -31,12 +31,19 @@ const MAX_IN_FLIGHT: usize = 32;
 const GROUP_TICK: Duration = Duration::from_millis(100);
 
 type ResponseFuture = Pin<Box<dyn Future<Output = Option<ResponseKind>> + Send>>;
+type FetchFuture = Pin<Box<dyn Future<Output = api::FetchBody> + Send>>;
+
+/// A pending response: most are encoded whole once ready, fetches are written while still being read.
+enum Response {
+    Message(ResponseFuture),
+    Fetch(FetchFuture),
+}
 
 struct InFlight {
     api_key: ApiKey,
     version: i16,
     correlation_id: i32,
-    response: ResponseFuture,
+    response: Response,
 }
 
 /// Accepts connections forever, serving each one on its own task, and enforces group timeouts.
@@ -98,15 +105,67 @@ async fn write_responses(
     mut queue: mpsc::Receiver<InFlight>,
 ) -> io::Result<()> {
     while let Some(request) = queue.recv().await {
-        if let Some(response) = request.response.await {
-            let frame = encode_response(
-                request.api_key,
-                request.version,
-                request.correlation_id,
-                &response,
-            )?;
-            writer.write_all(&frame).await?;
+        match request.response {
+            Response::Message(response) => {
+                if let Some(response) = response.await {
+                    let frame = encode_response(
+                        request.api_key,
+                        request.version,
+                        request.correlation_id,
+                        &response,
+                    )?;
+                    writer.write_all(&frame).await?;
+                }
+            }
+            Response::Fetch(body) => {
+                let body = body.await;
+                write_fetch(&mut writer, request.version, request.correlation_id, body).await?;
+            }
         }
+    }
+    Ok(())
+}
+
+/// Writes a `Fetch` response frame, sending each chunk of its body as soon as it has been read.
+async fn write_fetch<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    version: i16,
+    correlation_id: i32,
+    mut body: api::FetchBody,
+) -> io::Result<()> {
+    let mut header = BytesMut::new();
+    header.put_i32(0);
+    ResponseHeader::default()
+        .with_correlation_id(correlation_id)
+        .encode(&mut header, ApiKey::Fetch.response_header_version(version))
+        .map_err(invalid)?;
+    let len = i32::try_from(header.len() - 4 + body.len).map_err(invalid)?;
+    header[..4].copy_from_slice(&len.to_be_bytes());
+
+    let mut left = body.len;
+    let mut header = Some(header);
+    while let Some(chunk) = body.chunks.recv().await {
+        let chunk = chunk?;
+        left = left
+            .checked_sub(chunk.len())
+            .ok_or_else(|| invalid("fetch body longer than announced"))?;
+        let mut slices = [
+            IoSlice::new(header.as_deref().unwrap_or_default()),
+            IoSlice::new(&chunk),
+        ];
+        let mut slices = &mut slices[..];
+        IoSlice::advance_slices(&mut slices, 0);
+        while !slices.is_empty() {
+            let written = writer.write_vectored(slices).await?;
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            IoSlice::advance_slices(&mut slices, written);
+        }
+        header = None;
+    }
+    if left != 0 || header.is_some() {
+        return Err(invalid("fetch body ended early"));
     }
     Ok(())
 }
@@ -167,7 +226,7 @@ fn dispatch(broker: &Arc<Broker>, peer: Option<SocketAddr>, frame: Bytes) -> io:
             api_key,
             version,
             correlation_id,
-            response: Box::pin(ready(Some(response))),
+            response: Response::Message(Box::pin(ready(Some(response)))),
         });
     }
     let mut body = frame;
@@ -180,7 +239,34 @@ fn dispatch(broker: &Arc<Broker>, peer: Option<SocketAddr>, frame: Bytes) -> io:
     let request = RequestKind::decode(api_key, &mut body, version)
         .map_err(|e| invalid(format!("malformed {api_key:?} v{version}: {e}")))?;
     let broker = Arc::clone(broker);
-    let response: ResponseFuture = match request {
+    let response = match request {
+        RequestKind::Fetch(request) => {
+            Response::Fetch(Box::pin(api::fetch(broker, version, request)))
+        }
+        request => {
+            let client = || ClientInfo::new(header.client_id, peer);
+            Response::Message(
+                respond(broker, version, request, client)
+                    .ok_or_else(|| invalid(format!("no handler for {api_key:?}")))?,
+            )
+        }
+    };
+    Ok(InFlight {
+        api_key,
+        version,
+        correlation_id,
+        response,
+    })
+}
+
+/// The response future of a non-fetch request, or `None` for an API without a handler.
+fn respond(
+    broker: Arc<Broker>,
+    version: i16,
+    request: RequestKind,
+    client: impl FnOnce() -> ClientInfo,
+) -> Option<ResponseFuture> {
+    Some(match request {
         RequestKind::ApiVersions(_) => Box::pin(ready(Some(api::api_versions(0).into()))),
         RequestKind::Metadata(request) => {
             Box::pin(async move { Some(api::metadata(&broker, version, &request).into()) })
@@ -197,11 +283,13 @@ fn dispatch(broker: &Arc<Broker>, peer: Option<SocketAddr>, frame: Bytes) -> io:
             let produced = api::produce(&broker, version, request);
             Box::pin(async move { produced.await.map(Into::into) })
         }
-        RequestKind::Fetch(request) => {
-            Box::pin(async move { Some(api::fetch(broker, version, request).await.into()) })
-        }
         RequestKind::ListOffsets(request) => {
             Box::pin(async move { Some(api::list_offsets(broker, request).await.into()) })
+        }
+        RequestKind::OffsetForLeaderEpoch(request) => {
+            Box::pin(
+                async move { Some(api::offsets_for_leader_epoch(broker, request).await.into()) },
+            )
         }
         RequestKind::InitProducerId(request) => {
             Box::pin(async move { Some(api::init_producer_id(&broker, &request).into()) })
@@ -210,7 +298,7 @@ fn dispatch(broker: &Arc<Broker>, peer: Option<SocketAddr>, frame: Bytes) -> io:
             Box::pin(async move { Some(api::find_coordinator(&broker, version, &request).into()) })
         }
         RequestKind::JoinGroup(request) => {
-            let client = ClientInfo::new(header.client_id, peer);
+            let client = client();
             Box::pin(async move {
                 Some(
                     api::join_group(&broker, version, request, client)
@@ -232,7 +320,7 @@ fn dispatch(broker: &Arc<Broker>, peer: Option<SocketAddr>, frame: Bytes) -> io:
             Box::pin(async move { Some(api::offset_commit(&broker, request).await.into()) })
         }
         RequestKind::OffsetFetch(request) => {
-            Box::pin(async move { Some(api::offset_fetch(&broker, version, request).await.into()) })
+            Box::pin(async move { Some(api::offset_fetch(&broker, version, request).into()) })
         }
         RequestKind::DescribeGroups(request) => {
             Box::pin(async move { Some(api::describe_groups(&broker, version, &request).into()) })
@@ -243,13 +331,7 @@ fn dispatch(broker: &Arc<Broker>, peer: Option<SocketAddr>, frame: Bytes) -> io:
         RequestKind::DescribeConfigs(request) => {
             Box::pin(async move { Some(api::describe_configs(&broker, &request).into()) })
         }
-        _ => return Err(invalid(format!("no handler for {api_key:?}"))),
-    };
-    Ok(InFlight {
-        api_key,
-        version,
-        correlation_id,
-        response,
+        _ => return None,
     })
 }
 
@@ -278,6 +360,56 @@ fn invalid(error: impl Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `write_fetch` sends of a body announced as `len` bytes and made of `chunks`, through a
+    /// pipe small enough to force partial writes.
+    async fn fetch_frame(len: usize, chunks: Vec<io::Result<Bytes>>) -> (io::Result<()>, Vec<u8>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        for chunk in chunks {
+            sender.send(chunk).unwrap();
+        }
+        drop(sender);
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let reading = tokio::spawn(async move {
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).await.unwrap();
+            out
+        });
+        let body = api::FetchBody {
+            len,
+            chunks: receiver,
+        };
+        let written = write_fetch(&mut writer, 12, 9, body).await;
+        drop(writer);
+        (written, reading.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn write_fetch_frames_the_body_as_it_arrives() {
+        let chunks = vec![
+            Ok(Bytes::from(vec![1; 10])),
+            Ok(Bytes::from(vec![2; 10_000])),
+            Ok(Bytes::from(vec![3; 3])),
+        ];
+        let (written, frame) = fetch_frame(10_013, chunks).await;
+        written.unwrap();
+        let header = [&10_018_i32.to_be_bytes()[..], &9_i32.to_be_bytes(), &[0]].concat();
+        let body = [vec![1; 10], vec![2; 10_000], vec![3; 3]].concat();
+        assert_eq!(frame, [header, body].concat());
+    }
+
+    #[tokio::test]
+    async fn write_fetch_fails_on_a_body_that_breaks_its_length() {
+        let short = vec![Ok(Bytes::from(vec![1; 10]))];
+        assert!(fetch_frame(11, short).await.0.is_err());
+        let long = vec![Ok(Bytes::from(vec![1; 10])), Ok(Bytes::from(vec![2; 2]))];
+        assert!(fetch_frame(11, long).await.0.is_err());
+        let failed = vec![
+            Ok(Bytes::from(vec![1; 10])),
+            Err(io::ErrorKind::Other.into()),
+        ];
+        assert!(fetch_frame(20, failed).await.0.is_err());
+    }
 
     #[test]
     fn frame_len_accepts_only_sane_sizes() {
@@ -322,10 +454,12 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn dispatch_closes_on_garbage_without_panicking() {
         let dir = tempfile::tempdir().unwrap();
-        let broker = Arc::new(Broker::open(crate::broker::tests::config(dir.path())).unwrap());
+        let broker = Broker::start(crate::broker::tests::config(dir.path()), None)
+            .await
+            .unwrap();
         for frame in [
             &b"\x03\xe7\x00\x00\x00\x00\x00\x01"[..],
             b"\x00\x03\x00\x0c\x00\x00\x00\x01\xff\xff\x00\xff\xff\xff\xff\x0f",
