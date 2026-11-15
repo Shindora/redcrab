@@ -8,7 +8,7 @@ Usage (podman with the pinned images already pulled; redcrab also needs cargo an
     python3 bench/bench.py run redcrab baseline --bootstrap host.containers.internal:19092 [--replication-factor 1]
     python3 bench/bench.py compare [--all]
     python3 bench/bench.py chart
-    python3 bench/bench.py verify-failover <target>
+    python3 bench/bench.py verify-failover <target> [--fault partition]
 
 A run starts the target's cluster (3 brokers at replication factor 3, or with --brokers 1 one broker at replication
 factor 1; redcrab from an image built from this checkout), waits for it, creates the topic, drives load with Kafka's own
@@ -19,7 +19,8 @@ A run writes at most 12 GiB counting replicas and the probe; a max run that woul
 memory-capped brokers; real-hardware runs use the OpenMessaging Benchmark files in omb/. compare prints the latest result
 per target, workload and setup (broker count and replication factor), or every result with --all; chart draws light and
 dark SVGs per setup in bench/charts/. verify-failover starts 3 brokers, kills the leader of a one-partition topic several
-times under an acks=all producer, and checks that every acknowledged record can still be consumed.
+times under an acks=all producer, and checks that every acknowledged record can still be consumed; --fault partition cuts
+brokers off the network and heals them instead, and also checks that the replicas converge and live reads hold.
 """
 
 from __future__ import annotations
@@ -57,7 +58,8 @@ NETWORK = "bench_default"
 CLUSTER_BOOTSTRAP = "bench-1:9092"
 TOPIC = "bench"
 BIN = "/opt/kafka/bin"
-CLIENT_NAMES = ("bench-admin", "bench-producer", "bench-consumer")
+BROKERS = 3
+CLIENT_NAMES = ("bench-admin", "bench-producer", "bench-consumer", "bench-live", *(f"bench-dump-{i}" for i in range(1, BROKERS + 1)))
 
 BROKER_MEM_LIMIT = "384m"
 KAFKA_HEAP = "-Xms128m -Xmx128m"
@@ -76,7 +78,6 @@ COMPOSE_ENV = {
 
 RECORD_SIZE = 1024
 PARTITIONS = 100
-BROKERS = 3
 REPLICATION_FACTOR = 3
 MIN_INSYNC_REPLICAS = 2
 Setup = tuple[int | None, int]
@@ -108,6 +109,11 @@ FAILOVER_PRODUCER_PROPS = ("socket.connection.setup.timeout.ms=1000", "socket.co
 FAILOVER_SETTLE_SECONDS = 10
 FAILOVER_TIMEOUT_SECONDS = 60
 ACK_RUN_MS = 2000
+FAULTS = ("kill", "partition")
+LOG_FILES = {"kafka.yml": f"/var/lib/kafka/data/{TOPIC}-0/*.log", "redcrab.yml": "/data/partitions/*-0/*.log"}
+RECORD_RE = re.compile(r"^Offset:(\d+)\t(-?\d+)$", re.MULTILINE)
+BATCH_RE = re.compile(r"baseOffset: (\d+) lastOffset: (\d+) .*?partitionLeaderEpoch: (-?\d+) .*?crc: (\d+)")
+Batch = tuple[int, int, int, int]
 NOTE = "LOCAL smoke numbers from a small Podman VM with memory-capped brokers; not a real benchmark"
 UNMANAGED = "unmanaged: runs outside the driver"
 
@@ -219,6 +225,36 @@ class ConsumerStats:
     raw: dict[str, str]
 
 
+@dataclass(frozen=True)
+class Isolation:
+    """One round of the partition fault: cut partition 0's leader or a follower off the network, then heal it.
+
+    The broker is healed once the producer is acknowledged again (a follower is first kept away for
+    FAILOVER_SETTLE_SECONDS); with early_heal, a cut-off leader is healed as soon as another broker reports leading,
+    while the producer may still be waiting on it.
+    """
+
+    role: str
+    early_heal: bool = False
+
+
+@dataclass
+class FaultLog:
+    """What the fault rounds of a failover check saw: the client's longest pause per round and anything that went wrong."""
+
+    pauses: list[int] = field(default_factory=list)
+    anomalies: list[str] = field(default_factory=list)
+
+
+PARTITION_ROUNDS = (
+    Isolation("leader"),
+    Isolation("leader"),
+    Isolation("leader"),
+    Isolation("follower"),
+    Isolation("leader", early_heal=True),
+)
+
+
 TARGETS = {
     t.name: t
     for t in (
@@ -288,6 +324,12 @@ def compose(run: Run, *args: str) -> None:
     sh(["podman", "compose", "-f", str(BENCH_DIR / str(run.target.compose)), *args], env, timeout=300)
 
 
+def start_cluster(run: Run) -> None:
+    """Remove anything left from an earlier run, then start the run's brokers from local images only."""
+    cleanup(run)
+    compose(run, "up", "--detach", "--pull=never", *(f"bench-{i}" for i in run.nodes))
+
+
 def build_redcrab() -> dict[str, str]:
     """Cross-compile redcrab as a static Linux binary for the VM's CPU and package it as REDCRAB_IMAGE.
 
@@ -305,7 +347,7 @@ def build_redcrab() -> dict[str, str]:
     binary = REPO_DIR / "target" / triple / "release" / "redcrab"
     with tempfile.TemporaryDirectory() as context:
         shutil.copy2(binary, context)
-        sh(["podman", "build", "--file", str(BENCH_DIR / "Containerfile"), "--tag", REDCRAB_IMAGE, context])
+        sh(["podman", "build", "--pull=never", "--file", str(BENCH_DIR / "Containerfile"), "--tag", REDCRAB_IMAGE, context])
     git = ["git", "-C", str(REPO_DIR)]
     changed = sh([*git, "status", "--porcelain", "--", "src", "Cargo.toml", "Cargo.lock"]).strip()
     return {
@@ -322,11 +364,11 @@ def running_broker() -> dict[str, object]:
     return {"image_id": image_id, "container_mem_bytes": int(memory)}
 
 
-def client(run: Run, role: str, *args: str) -> list[str]:
-    """Build a podman command that runs a Kafka CLI tool in a throwaway client container."""
+def client(run: Run, role: str, *args: str, options: tuple[str, ...] = ()) -> list[str]:
+    """Build a podman command that runs a Kafka CLI tool in a throwaway client container, with extra podman run options."""
     network = ["--network", run.network] if run.network else []
     jvm = ["-e", f"KAFKA_HEAP_OPTS={CLIENT_HEAP}", "-e", f"KAFKA_JVM_PERFORMANCE_OPTS={CLIENT_JVM_OPTS}"]
-    return ["podman", "run", "--rm", "--name", f"bench-{role}", *network, *jvm, KAFKA_IMAGE, *args]
+    return ["podman", "run", "--rm", "--pull=never", "--name", f"bench-{role}", *network, *options, *jvm, KAFKA_IMAGE, *args]
 
 
 def wait_ready(run: Run, timeout: float = 240) -> None:
@@ -569,8 +611,7 @@ def run_benchmark(run: Run) -> Path:
     broker: dict[str, object] = {"image_id": None, "container_mem_bytes": None}
     try:
         if run.target.compose:
-            cleanup(run)
-            compose(run, "up", "--detach", *(f"bench-{i}" for i in run.nodes))
+            start_cluster(run)
             broker = running_broker()
         wait_ready(run)
         if run.target.name == "redpanda":
@@ -613,14 +654,23 @@ def run_benchmark(run: Run) -> Path:
     return path
 
 
-def partition_leader(run: Run) -> int:
-    """Return the broker that leads partition 0 of the topic, as the cluster reports it."""
-    out = sh(client(run, "admin", f"{BIN}/kafka-topics.sh", "--bootstrap-server", run.bootstrap, "--describe", "--topic", TOPIC))
+def leader_view(run: Run) -> int | None:
+    """Return the broker that leads partition 0 as the reachable brokers report it, or None when they report none."""
+    args = ["--bootstrap-server", run.bootstrap, "--describe", "--topic", TOPIC]
+    out = sh(client(run, "admin", f"{BIN}/kafka-topics.sh", *args), check=False)
     found = re.search(r"Partition: 0\s+Leader: (\d+)", out)
-    if found is None:
-        msg = f"partition 0 has no leader:\n{out[-2000:]}"
-        raise RuntimeError(msg)
-    return int(found[1])
+    return int(found[1]) if found else None
+
+
+def partition_leader(run: Run) -> int:
+    """Return the broker that leads partition 0 of the topic, waiting up to FAILOVER_TIMEOUT_SECONDS for one."""
+    deadline = time.monotonic() + FAILOVER_TIMEOUT_SECONDS
+    while (leader := leader_view(run)) is None:
+        if time.monotonic() > deadline:
+            msg = f"partition 0 has had no leader for {FAILOVER_TIMEOUT_SECONDS} s"
+            raise RuntimeError(msg)
+        time.sleep(1)
+    return leader
 
 
 def read_acks(lines: Iterable[str], acked: list[tuple[int, int]], errors: list[str]) -> None:
@@ -633,8 +683,36 @@ def read_acks(lines: Iterable[str], acked: list[tuple[int, int]], errors: list[s
             errors.append(f"{event.get('exception')}: {event.get('message')}")
 
 
-def await_recovery(acked: list[tuple[int, int]], start: int) -> int:
-    """Wait until records were acknowledged for ACK_RUN_MS after the longest pause since acked[start]; return that pause in ms."""
+def read_records(lines: Iterable[str], records: list[tuple[int, int]]) -> None:
+    """Collect (offset, value) of each record a console consumer prints with print.offset=true."""
+    for line in lines:
+        found = RECORD_RE.match(line.rstrip("\n"))
+        if found:
+            records.append((int(found[1]), int(found[2])))
+
+
+def follow(cmd: list[str], parse: Callable[..., None], *sinks: list) -> tuple[subprocess.Popen[str], threading.Thread]:
+    """Start a client that runs until stopped and parse its output into sinks on a thread of its own."""
+    log(f"$ {shlex.join(cmd)}")
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)  # noqa: S603
+    reader = threading.Thread(target=parse, args=(proc.stdout, *sinks), daemon=True)
+    reader.start()
+    return proc, reader
+
+
+def stop(name: str, proc: subprocess.Popen[str], reader: threading.Thread) -> None:
+    """Stop a client started with follow, letting it print its last lines."""
+    sh(["podman", "kill", "--signal", "TERM", name], check=False)
+    proc.wait(60)
+    reader.join(60)
+
+
+def await_recovery(acked: list[tuple[int, int]], start: int) -> int | None:
+    """Wait until records were acknowledged for ACK_RUN_MS after the longest pause since acked[start]; return that pause in ms.
+
+    Returns:
+        The pause, or None when the producer is not back after FAILOVER_TIMEOUT_SECONDS.
+    """
     deadline = time.monotonic() + FAILOVER_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         times = [t for t, _ in acked[start:]]
@@ -642,30 +720,236 @@ def await_recovery(acked: list[tuple[int, int]], start: int) -> int:
         if times[-1] - times[end] >= ACK_RUN_MS:
             return pause
         time.sleep(0.5)
-    msg = f"no records acknowledged for {FAILOVER_TIMEOUT_SECONDS} s after the kill"
-    raise RuntimeError(msg)
+    return None
 
 
-def consume_values(run: Run) -> list[int]:
-    """Read the whole topic with the console consumer and return the record values, checking the tool's own count."""
+def consume_records(run: Run) -> list[tuple[int, int]]:
+    """Read the whole topic with the console consumer and return (offset, value) per record, checking the tool's own count."""
     args = ["--bootstrap-server", run.bootstrap, "--topic", TOPIC, "--from-beginning", "--timeout-ms", "20000"]
+    args += ["--formatter-property", "print.offset=true"]
     out = sh(client(run, "consumer", f"{BIN}/kafka-console-consumer.sh", *args), check=False)
-    values = [int(line) for line in out.splitlines() if line.isdigit()]
+    records = [(int(offset), int(value)) for offset, value in RECORD_RE.findall(out)]
     total = re.search(r"Processed a total of (\d+) messages", out)
-    if total is None or int(total[1]) != len(values):
+    if total is None or int(total[1]) != len(records):
         msg = f"consumer output does not add up:\n{out[-2000:]}"
         raise RuntimeError(msg)
-    return values
+    return records
 
 
-def verify_failover(target: Target) -> bool:
-    """Kill the leader of a one-partition topic under an acks=all producer, restarting it each time, then read the topic back.
+def settle(acked: list[tuple[int, int]]) -> None:
+    """Let the producer run undisturbed for FAILOVER_SETTLE_SECONDS before the next fault."""
+    time.sleep(FAILOVER_SETTLE_SECONDS)
+    if not acked:
+        msg = "the producer has no acknowledged records"
+        raise RuntimeError(msg)
 
-    Every acknowledged record must be read back; retries may duplicate records. The failover time the client sees is the
-    longest pause between acknowledgements after each kill, with otherwise default producer settings and acks=all.
+
+def kill_rounds(run: Run, acked: list[tuple[int, int]]) -> FaultLog:
+    """Kill partition 0's leader FAILOVER_KILLS times, starting it again once the producer is acknowledged again."""
+    faults = FaultLog()
+    for kill in range(1, FAILOVER_KILLS + 1):
+        settle(acked)
+        leader = partition_leader(run)
+        start = len(acked) - 1
+        sh(["podman", "kill", f"bench-{leader}"])
+        pause = await_recovery(acked, start)
+        if pause is None:
+            msg = f"no records acknowledged for {FAILOVER_TIMEOUT_SECONDS} s after the kill"
+            raise RuntimeError(msg)
+        faults.pauses.append(pause)
+        log(f"kill {kill}: bench-{leader} led partition 0; no record was acknowledged for {pause:,} ms")
+        sh(["podman", "start", f"bench-{leader}"])
+    return faults
+
+
+def network_address(node: int) -> dict[str, object]:
+    """Return bench-<node>'s IP address, MAC address and aliases on the benchmark network, empty when it is not attached."""
+    out = sh(["podman", "container", "inspect", "--format", "{{json .NetworkSettings.Networks}}", f"bench-{node}"])
+    return (json.loads(out) or {}).get(NETWORK) or {}
+
+
+def heal(node: int, address: dict[str, object], began: float) -> str:
+    """Reconnect bench-<node> with the IP and MAC address it had, as a healed partition would; describe the heal.
+
+    If another container took the IP meanwhile, the node reconnects with a new one and the description says so.
+    """
+    name = f"bench-{node}"
+    aliases = [f"--alias={alias}" for alias in dict.fromkeys(address.get("Aliases") or [])]
+    same = ["--ip", str(address["IPAddress"]), "--mac-address", str(address["MacAddress"])]
+    try:
+        sh(["podman", "network", "connect", *aliases, *same, NETWORK, name])
+    except RuntimeError as error:
+        log(f"reconnecting {name} with its old address failed, so it gets a new one: {error}")
+        sh(["podman", "network", "connect", *aliases, NETWORK, name])
+    now = network_address(node).get("IPAddress")
+    same = "the same address" if now == address["IPAddress"] else f"a NEW address {now} (was {address['IPAddress']})"
+    return f"healed after {time.monotonic() - began:.0f} s with {same}"
+
+
+def new_leader_note(run: Run, node: int, began: float, faults: FaultLog) -> str:
+    """Poll the reachable brokers until one other than bench-<node> leads partition 0; describe when that happened."""
+    while time.monotonic() - began < FAILOVER_TIMEOUT_SECONDS:
+        leader = leader_view(run)
+        if leader is not None and leader != node:
+            return f"bench-{leader} was reported leading {time.monotonic() - began:.0f} s after the cut"
+        time.sleep(0.5)
+    faults.anomalies.append(f"no broker other than the isolated bench-{node} was reported leading for {FAILOVER_TIMEOUT_SECONDS} s")
+    return "no other broker was reported leading"
+
+
+def replica_log(run: Run, node: int) -> list[Batch] | None:
+    """List the batches of partition 0's log on bench-<node>, read from its volume with kafka-dump-log.
+
+    Each batch is (base offset, last offset, leader epoch, CRC), so identical lists mean identical replicas.
 
     Returns:
-        True when no acknowledged record is missing.
+        The batches, or None for a target whose log files kafka-dump-log cannot read.
+    """
+    pattern = LOG_FILES.get(str(run.target.compose))
+    if pattern is None:
+        return None
+    script = f'exec {BIN}/kafka-dump-log.sh --files "$(ls {pattern} | paste -sd, -)"'
+    options = ("--volumes-from", f"bench-{node}:ro", "--user", "root")
+    out = sh(client(replace(run, network="none"), f"dump-{node}", "bash", "-c", script, options=options), check=False)
+    return [(int(m[1]), int(m[2]), int(m[3]), int(m[4])) for m in BATCH_RE.finditer(out)]
+
+
+def log_end(batches: list[Batch] | None) -> int:
+    """Return the log end offset of a replica's batches."""
+    return batches[-1][1] + 1 if batches else 0
+
+
+def partition_end(run: Run) -> int | None:
+    """Return partition 0's end offset as its leader reports it, or None without an answer."""
+    args = ["--bootstrap-server", run.bootstrap, "--topic", TOPIC, "--partitions", "0", "--time", "-1"]
+    out = sh(client(run, "admin", f"{BIN}/kafka-get-offsets.sh", *args), check=False)
+    found = re.search(rf"^{TOPIC}:0:(\d+)$", out, re.MULTILINE)
+    return int(found[1]) if found else None
+
+
+def catch_up_note(run: Run, node: int, faults: FaultLog) -> str:
+    """Wait until the healed bench-<node> holds partition 0 up to the end offset its leader reports now; describe how long that took."""
+    if str(run.target.compose) not in LOG_FILES:
+        return "catch-up not checked for this target"
+    began = time.monotonic()
+    while (end := partition_end(run)) is None and time.monotonic() - began < FAILOVER_TIMEOUT_SECONDS:
+        time.sleep(1)
+    if end is None:
+        faults.anomalies.append(f"no end offset for partition 0 for {FAILOVER_TIMEOUT_SECONDS} s after bench-{node} was healed")
+        return "no end offset"
+    began = time.monotonic()
+    while time.monotonic() - began < FAILOVER_TIMEOUT_SECONDS:
+        if log_end(replica_log(run, node)) >= end:
+            return f"its replica reached offset {end:,} within {time.monotonic() - began:.0f} s"
+        time.sleep(1)
+    faults.anomalies.append(f"bench-{node} had not reached offset {end:,} {FAILOVER_TIMEOUT_SECONDS} s after the heal")
+    return f"its replica had not reached offset {end:,} after {FAILOVER_TIMEOUT_SECONDS} s"
+
+
+def partition_round(run: Run, label: str, isolation: Isolation, acked: list[tuple[int, int]], faults: FaultLog) -> bool:
+    """Cut partition 0's leader or a follower off the network under load, heal it, and wait for its replica to catch up.
+
+    Returns:
+        False when the producer got no acknowledgement for FAILOVER_TIMEOUT_SECONDS, which ends the rounds.
+    """
+    leader = partition_leader(run)
+    node = leader if isolation.role == "leader" else min(set(run.nodes) - {leader})
+    address = network_address(node)
+    start, began = len(acked) - 1, time.monotonic()
+    sh(["podman", "network", "disconnect", NETWORK, f"bench-{node}"])
+    notes = [f"{label}: cut off the {isolation.role} bench-{node} ({address.get('IPAddress')})"]
+    if isolation.role == "leader":
+        notes.append(new_leader_note(run, node, began, faults))
+    else:
+        time.sleep(FAILOVER_SETTLE_SECONDS)
+    if isolation.early_heal:
+        notes.append(heal(node, address, began))
+    pause = await_recovery(acked, start)
+    if not isolation.early_heal:
+        notes.append(heal(node, address, began))
+    if pause is None:
+        faults.anomalies.append(f"{label}: no record was acknowledged for {FAILOVER_TIMEOUT_SECONDS} s after bench-{node} was cut off")
+    else:
+        faults.pauses.append(pause)
+        notes.append(f"no record was acknowledged for {pause:,} ms")
+    notes.append(catch_up_note(run, node, faults))
+    log("; ".join(notes))
+    return pause is not None
+
+
+def partition_rounds(run: Run, acked: list[tuple[int, int]]) -> FaultLog:
+    """Run PARTITION_ROUNDS, stopping early if the producer does not recover from one."""
+    faults = FaultLog()
+    for number, isolation in enumerate(PARTITION_ROUNDS, 1):
+        settle(acked)
+        label = f"round {number} ({isolation.role}{', healed early' if isolation.early_heal else ''})"
+        if not partition_round(run, label, isolation, acked, faults):
+            break
+    return faults
+
+
+def await_convergence(run: Run) -> dict[int, list[Batch]]:
+    """Read every replica of partition 0 until all hold the same batches or FAILOVER_TIMEOUT_SECONDS pass; return the last reads."""
+    deadline = time.monotonic() + FAILOVER_TIMEOUT_SECONDS
+    while True:
+        logs = {node: replica_log(run, node) or [] for node in run.nodes}
+        if len({tuple(batches) for batches in logs.values()}) == 1 or time.monotonic() > deadline:
+            return logs
+        time.sleep(2)
+
+
+def divergence(logs: dict[int, list[Batch]]) -> str | None:
+    """Describe the first batch where the replicas differ, or None when they are identical."""
+    if len({tuple(batches) for batches in logs.values()}) <= 1:
+        return None
+    index = next(i for i in itertools.count() if len({batches[i] if i < len(batches) else None for batches in logs.values()}) > 1)
+    held = "; ".join(f"bench-{node} {batches[index] if index < len(batches) else 'nothing'}" for node, batches in logs.items())
+    return f"the replicas differ from batch {index} on (base offset, last offset, leader epoch, CRC): {held}"
+
+
+def await_live(live: list[tuple[int, int]], consumed: list[tuple[int, int]]) -> None:
+    """Give the live consumer up to FAILOVER_SETTLE_SECONDS to reach the last offset the final read found."""
+    last = max((offset for offset, _ in consumed), default=-1)
+    deadline = time.monotonic() + FAILOVER_SETTLE_SECONDS
+    while max((offset for offset, _ in live), default=-1) < last and time.monotonic() < deadline:
+        time.sleep(0.5)
+
+
+def check_partition(consumed: list[tuple[int, int]], live: list[tuple[int, int]], logs: dict[int, list[Batch]], faults: FaultLog) -> bool:
+    """Log what the partition rounds left behind: live reads the final log contradicts, replica divergence and anomalies.
+
+    Returns:
+        True when every live read matches the final log, the replicas are identical and no round saw an anomaly.
+    """
+    final = dict(consumed)
+    contradicted = [(offset, value) for offset, value in live if final.get(offset) != value]
+    reached = max((offset for offset, _ in live), default=-1)
+    log(f"the live consumer read {len(live):,} records up to offset {reached:,}; {len(contradicted):,} disagree with the final log")
+    if contradicted:
+        log(f"CONTRADICTED live reads (offset, value), for example {contradicted[:10]}")
+    split = divergence(logs) if logs else None
+    if logs:
+        ends = ", ".join(f"bench-{node} {log_end(batches):,} ({len(batches):,} batches)" for node, batches in logs.items())
+        log(f"replica log end offsets after the heal: {ends}; {split or 'every replica holds the same batches'}")
+    else:
+        log("replica logs not compared: kafka-dump-log cannot read this target's log files")
+    for anomaly in faults.anomalies:
+        log(f"ANOMALY: {anomaly}")
+    return not contradicted and split is None and not faults.anomalies
+
+
+def verify_failover(target: Target, fault: str) -> bool:
+    """Kill or cut off brokers of a one-partition topic under an acks=all producer, then read the topic back.
+
+    With fault "kill", the leader is killed and started again FAILOVER_KILLS times. With "partition", PARTITION_ROUNDS
+    cut a broker off the network shared by the brokers and the clients and heal it, while a live consumer reads along;
+    afterwards every replica must hold the same batches and every live read must match the final log. Every acknowledged
+    record must be read back. kafka-verifiable-producer turns retries off, so a failed send is reported as a send error,
+    and such records may or may not be in the log. The failover time the client sees is the longest pause between
+    acknowledgements after each fault, with otherwise default producer settings and acks=all.
+
+    Returns:
+        True when no acknowledged record is missing and, for "partition", nothing else went wrong.
     """
     run = Run(
         target=target,
@@ -681,10 +965,10 @@ def verify_failover(target: Target) -> bool:
         build_redcrab()
     acked: list[tuple[int, int]] = []
     errors: list[str] = []
-    pauses: list[int] = []
+    live: list[tuple[int, int]] = []
+    logs: dict[int, list[Batch]] = {}
     try:
-        cleanup(run)
-        compose(run, "up", "--detach", *(f"bench-{i}" for i in run.nodes))
+        start_cluster(run)
         wait_ready(run)
         if target.name == "redpanda":
             redpanda_settings()
@@ -694,38 +978,34 @@ def verify_failover(target: Target) -> bool:
             f"exec {BIN}/kafka-verifiable-producer.sh --bootstrap-server {run.bootstrap} --topic {TOPIC} "
             f"--throughput {FAILOVER_RATE} --acks -1 --command-config /tmp/producer.properties"
         )
-        cmd = client(run, "producer", "bash", "-c", script)
-        log(f"$ {shlex.join(cmd)}")
-        producer = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)  # noqa: S603
-        reader = threading.Thread(target=read_acks, args=(producer.stdout, acked, errors), daemon=True)
-        reader.start()
-        for kill in range(1, FAILOVER_KILLS + 1):
-            time.sleep(FAILOVER_SETTLE_SECONDS)
-            if not acked:
-                msg = "the producer has no acknowledged records"
-                raise RuntimeError(msg)
-            leader = partition_leader(run)
-            start = len(acked) - 1
-            sh(["podman", "kill", f"bench-{leader}"])
-            pauses.append(await_recovery(acked, start))
-            log(f"kill {kill}: bench-{leader} led partition 0; no record was acknowledged for {pauses[-1]:,} ms")
-            sh(["podman", "start", f"bench-{leader}"])
+        producer = follow(client(run, "producer", "bash", "-c", script), read_acks, acked, errors)
+        if fault == "partition":
+            args = ["--bootstrap-server", run.bootstrap, "--topic", TOPIC, "--partition", "0", "--offset", "earliest"]
+            args += ["--formatter-property", "print.offset=true"]
+            reader = follow(client(run, "live", f"{BIN}/kafka-console-consumer.sh", *args), read_records, live)
+        faults = partition_rounds(run, acked) if fault == "partition" else kill_rounds(run, acked)
         time.sleep(FAILOVER_SETTLE_SECONDS)
-        sh(["podman", "kill", "--signal", "TERM", "bench-producer"])
-        producer.wait(60)
-        reader.join(60)
-        consumed = consume_values(run)
+        stop("bench-producer", *producer)
+        if fault == "partition" and str(target.compose) in LOG_FILES:
+            logs = await_convergence(run)
+        consumed = consume_records(run)
+        if fault == "partition":
+            await_live(live, consumed)
+            stop("bench-live", *reader)
     finally:
         cleanup(run)
+    values = [value for _, value in consumed]
     distinct = {value for _, value in acked}
-    missing = sorted(distinct - set(consumed))
+    missing = sorted(distinct - set(values))
     log(f"acknowledged {len(distinct):,} distinct records ({len(acked):,} acknowledgements, {len(errors):,} send errors)")
     for error in sorted(set(errors)):
         log(f"send error x{errors.count(error)}: {error}")
-    log(f"consumed {len(consumed):,} records, {len(consumed) - len(set(consumed)):,} of them duplicates")
-    log(f"failover seen by the client (longest pause in acknowledgements after each kill): {', '.join(f'{p:,}' for p in pauses)} ms")
+    log(f"consumed {len(values):,} records, {len(values) - len(set(values)):,} of them duplicates")
+    pauses = ", ".join(f"{pause:,}" for pause in faults.pauses)
+    log(f"failover seen by the client (longest pause between acknowledgements after each fault): {pauses} ms")
+    healthy = check_partition(consumed, live, logs, faults) if fault == "partition" else True
     log(f"LOST {len(missing):,} acknowledged records, for example {missing[:20]}" if missing else "no acknowledged record is missing")
-    return not missing
+    return not missing and healthy
 
 
 def fmt(value: object, digits: int = 0) -> str:
@@ -798,6 +1078,7 @@ def table_row(result: dict) -> tuple[str, ...]:
     short = "*" if c["records"] < c["requested"] else ""
     layout = f"{broker_count(result) or '?'}/{w['replication_factor']}"
     seconds = f"~{run_seconds(result):.0f} capped" if capped(result) else fmt(w["seconds"])
+    seconds += " pre-cap" if w["rate"] < 0 and not under_cap(result) else ""
     row = (result["target"], w["name"], layout, fmt(w["partitions"]), seconds, rate)
     row += (fmt(p["records_per_sec"]), fmt(p["mb_per_sec"], 1))
     row += tuple(fmt(p["latency_ms"][k]) for k in ("avg", "p50", "p95", "p99", "p99.9", "max"))
@@ -834,7 +1115,7 @@ def compare(*, every_run: bool = False) -> None:
     log("produce. Consumer rates exclude group-join time. * = consumer stopped before reading every requested record. ? = broker")
     cap = MAX_RUN_BYTES // 2**30
     log(f"count not recorded (broker not started by the harness). capped = max run cut to the {cap} GiB record cap (replicas and")
-    log("probe included); sec is then its length at the measured rate instead of --seconds.")
+    log("probe included); sec is then its length at the measured rate instead of --seconds. pre-cap = max run from before the cap.")
 
 
 def harness_managed(result: dict) -> bool:
@@ -842,11 +1123,19 @@ def harness_managed(result: dict) -> bool:
     return result["image"] != "unmanaged" and result["host"]["broker_container_mem_limit"] == BROKER_MEM_LIMIT
 
 
+def under_cap(result: dict) -> bool:
+    """Tell whether a max run ran under the record cap, which can cut it short; older max runs always ran their full time."""
+    return result["workload"]["rate"] < 0 and "record_cap" in result
+
+
 def method(result: dict) -> str:
-    """Identify what a run measured (image, build, workload settings, probe, record cap), so only like runs count as repeats."""
+    """Identify what a run measured (image, build, workload settings, probe, record cap), so only like runs count as repeats.
+
+    A max run from before the record cap never counts as a repeat of one under it, even when the cap did not cut it.
+    """
     build = result.get("build", {})
     binary = build.get("binary_sha256") or build.get("commit")
-    return json.dumps([result["image"], binary, result["workload"], "probe" in result, capped(result)], sort_keys=True)
+    return json.dumps([result["image"], binary, result["workload"], "probe" in result, capped(result), under_cap(result)], sort_keys=True)
 
 
 def chart_runs(results: list[dict], setup: Setup) -> dict[tuple[str, str], list[dict]]:
@@ -887,6 +1176,29 @@ def spread_example(groups: dict[tuple[str, str], list[dict]]) -> str:
     return f" (for example, {key[0]} {key[1]} p99 was {', '.join(values[:-1])} and {values[-1]} ms in {len(values)} runs)"
 
 
+def cap_would_cut(result: dict) -> bool:
+    """Tell whether the record cap would cut a max run from before it, at the rate its probe measured."""
+    cap = MAX_RUN_BYTES // (RECORD_SIZE * result["workload"]["replication_factor"])
+    return result.get("probe", {}).get("records_per_sec", 0) * result["workload"]["seconds"] > cap - cap // PROBE_SHARE
+
+
+def pre_cap_note(groups: dict[tuple[str, str], list[dict]]) -> str:
+    """Name the charted max rows that ran before the record cap and say whether it would have cut them; empty when none."""
+    rows = [key for key, runs in groups.items() if runs[-1]["workload"]["rate"] < 0 and not under_cap(runs[-1])]
+    rows.sort(key=lambda key: sort_key(groups[key][-1]))
+    if not rows:
+        return ""
+    cut = [f"{target} {workload}" for target, workload in rows if any(cap_would_cut(r) for r in groups[target, workload])]
+    verdict = f"it would have cut {and_list(cut)}" if cut else "it would not have cut any of them"
+    names = and_list([f"{target} {workload}" for target, workload in rows])
+    return f"The {names} rows ran before the record cap; at the rates their probes measured, {verdict}."
+
+
+def and_list(items: list[str]) -> str:
+    """Join items as "a", "a and b" or "a, b and c"."""
+    return " and ".join([", ".join(items[:-1]), items[-1]]) if len(items) > 1 else "".join(items)
+
+
 def chart_notes(setup: Setup, groups: dict[tuple[str, str], list[dict]]) -> list[str]:
     """Caption paragraphs that travel with the image: what the numbers are, where and how they ran, and what is missing."""
     runs = [r for key in sorted(groups) for r in groups[key]]
@@ -925,9 +1237,12 @@ def chart_notes(setup: Setup, groups: dict[tuple[str, str], list[dict]]) -> list
         )
         notes.append(
             f"Rows marked capped hit the harness's cap of {MAX_RUN_BYTES // 2**30} GiB written per run, replicas and probe included,"
-            f" so they ran shorter than the unmarked rows, which ran their full time: {lengths}.",
+            f" so each run sent fewer records than its probe planned for the full time, unlike the unmarked rows. At the rates they"
+            f" measured, {lengths}.",
         )
-    days = sorted({r["timestamp"][:10] for r in runs})
+    if note := pre_cap_note(groups):
+        notes.append(note)
+    days =sorted({r["timestamp"][:10] for r in runs})
     when = days[0] if len(days) == 1 else f"{days[0]} to {days[-1]}"
     notes.append(f"Runs from {when}. Full table: python3 bench/bench.py compare (with --all for every run).")
     return notes
@@ -1226,8 +1541,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     tables = commands.add_parser("compare", help="one table per setup with the latest result per target and workload")
     tables.add_argument("--all", action="store_true", dest="every_run", help="list every result instead of the latest")
     commands.add_parser("chart", help="light and dark SVG charts per setup, written to bench/charts/")
-    failover = commands.add_parser("verify-failover", help="kill partition leaders under acks=all load and check for lost records")
+    failover = commands.add_parser("verify-failover", help="kill or cut off brokers under acks=all load and check for lost records")
     failover.add_argument("target", choices=TARGETS)
+    failover.add_argument("--fault", choices=FAULTS, default="kill", help="kill the leader (default) or cut brokers off the network")
     return parser.parse_args(argv)
 
 
@@ -1242,7 +1558,7 @@ def main(argv: list[str]) -> int:
         chart()
         return 0
     if args.command == "verify-failover":
-        return 0 if verify_failover(TARGETS[args.target]) else 1
+        return 0 if verify_failover(TARGETS[args.target], args.fault) else 1
     target = TARGETS[args.target]
     if target.name != "redcrab" and (args.bootstrap or args.replication_factor):
         sys.exit("--bootstrap and --replication-factor apply to redcrab only")

@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="800" height="957" viewBox="0 0 800 957" role="img" font-family="-apple-system, BlinkMacSystemFont, &#x27;Segoe UI&#x27;, Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="1040" viewBox="0 0 800 1040" role="img" font-family="-apple-system, BlinkMacSystemFont, &#x27;Segoe UI&#x27;, Helvetica, Arial, sans-serif">
 <title>Throughput, MB/s: 1 broker, replication factor 1 (local smoke test, not a benchmark)</title>
-<rect x="0.5" y="0.5" width="799" height="956" rx="6" fill="#1a1a19" stroke="#2c2c2a"/>
+<rect x="0.5" y="0.5" width="799" height="1039" rx="6" fill="#1a1a19" stroke="#2c2c2a"/>
 <text x="16" y="30" font-size="15" fill="#f0efec" font-weight="600">Throughput, MB/s: 1 broker, replication factor 1</text>
 <text x="16" y="50" font-size="12" fill="#c3c2b7">Producer send rate and consumer fetch rate (excluding group join). Fixed-rate workloads cap the producer.</text>
 <path d="M16 63H24A4 4 0 0 1 28 67V73A4 4 0 0 1 24 77H16Z" fill="#3987e5"/>
@@ -18,7 +18,7 @@
 <text x="28" y="331" font-size="12" fill="#f0efec">kafka</text>
 <text x="28" y="363" font-size="12" fill="#f0efec">kafka-fsync</text>
 <text x="28" y="395" font-size="12" fill="#f0efec">redpanda</text>
-<text x="28" y="427" font-size="12" fill="#f0efec">redcrab</text>
+<text x="28" y="427" font-size="12" fill="#f0efec">redcrab (capped)</text>
 <text x="16" y="466" font-size="12.5"><tspan font-weight="600" fill="#f0efec">small-batch</tspan><tspan dx="8" fill="#c3c2b7">fixed 1,000 rec/s, linger.ms=0, batch.size=16384, 10,000 keys</tspan></text>
 <text x="28" y="491" font-size="12" fill="#f0efec">kafka</text>
 <text x="28" y="517" font-size="12" fill="#f0efec">kafka-fsync</text>
@@ -61,7 +61,7 @@
 <g><title>kafka max: producer 30.5 MB/s; earlier run 26.4 MB/s</title><rect x="236" y="337.5" width="13.8" height="3" rx="1.5" fill="#898781"/><path d="M236 320H248A4 4 0 0 1 252 324V330A4 4 0 0 1 248 334H236Z" fill="#3987e5"/><text x="258" y="331" font-size="11.5" fill="#f0efec">30.5</text></g>
 <g><title>kafka-fsync max: producer 13.7 MB/s; earlier run 1.1 MB/s</title><rect x="236" y="369.5" width="1" height="3" rx="1.5" fill="#898781"/><path d="M236 352H239.2A4 4 0 0 1 243.2 356V362A4 4 0 0 1 239.2 366H236Z" fill="#3987e5"/><text x="249.2" y="363" font-size="11.5" fill="#f0efec">13.7</text></g>
 <g><title>redpanda max: producer 257.1 MB/s; earlier run 305.7 MB/s</title><rect x="236" y="401.5" width="160.5" height="3" rx="1.5" fill="#898781"/><path d="M236 384H367A4 4 0 0 1 371 388V394A4 4 0 0 1 367 398H236Z" fill="#3987e5"/><text x="377" y="395" font-size="11.5" fill="#f0efec">257.1</text></g>
-<g><title>redcrab max: producer 303.8 MB/s; earlier run 293.7 MB/s</title><rect x="236" y="433.5" width="154.2" height="3" rx="1.5" fill="#898781"/><path d="M236 416H391.5A4 4 0 0 1 395.5 420V426A4 4 0 0 1 391.5 430H236Z" fill="#3987e5"/><text x="401.5" y="427" font-size="11.5" fill="#f0efec">303.8</text></g>
+<g><title>redcrab max: producer 295.8 MB/s; earlier run 198.4 MB/s</title><rect x="236" y="433.5" width="104.1" height="3" rx="1.5" fill="#898781"/><path d="M236 416H387.3A4 4 0 0 1 391.3 420V426A4 4 0 0 1 387.3 430H236Z" fill="#3987e5"/><text x="397.3" y="427" font-size="11.5" fill="#f0efec">295.8</text></g>
 <g><title>kafka small-batch: producer 1.0 MB/s</title><path d="M236 480H236A0.5 0.5 0 0 1 236.5 480.5V493.5A0.5 0.5 0 0 1 236 494H236Z" fill="#3987e5"/><text x="242.5" y="491" font-size="11.5" fill="#f0efec">1.0</text></g>
 <g><title>kafka-fsync small-batch: producer 1.0 MB/s</title><path d="M236 506H236A0.5 0.5 0 0 1 236.5 506.5V519.5A0.5 0.5 0 0 1 236 520H236Z" fill="#3987e5"/><text x="242.5" y="517" font-size="11.5" fill="#f0efec">1.0</text></g>
 <g><title>redpanda small-batch: producer 1.0 MB/s</title><path d="M236 532H236A0.5 0.5 0 0 1 236.5 532.5V545.5A0.5 0.5 0 0 1 236 546H236Z" fill="#3987e5"/><text x="242.5" y="543" font-size="11.5" fill="#f0efec">1.0</text></g>
@@ -102,7 +102,7 @@
 <g><title>kafka max: consumer 458.4 MB/s; earlier run 440.1 MB/s</title><rect x="522" y="337.5" width="115.5" height="3" rx="1.5" fill="#898781"/><path d="M522 320H638.3A4 4 0 0 1 642.3 324V330A4 4 0 0 1 638.3 334H522Z" fill="#3987e5"/><text x="648.3" y="331" font-size="11.5" fill="#f0efec">458.4</text></g>
 <g><title>kafka-fsync max: consumer 84.5 MB/s; earlier run 79.1 MB/s</title><rect x="522" y="369.5" width="20.8" height="3" rx="1.5" fill="#898781"/><path d="M522 352H540.2A4 4 0 0 1 544.2 356V362A4 4 0 0 1 540.2 366H522Z" fill="#3987e5"/><text x="550.2" y="363" font-size="11.5" fill="#f0efec">84.5</text></g>
 <g><title>redpanda max: consumer 251.4 MB/s; earlier run 357.1 MB/s</title><rect x="522" y="401.5" width="93.7" height="3" rx="1.5" fill="#898781"/><path d="M522 384H584A4 4 0 0 1 588 388V394A4 4 0 0 1 584 398H522Z" fill="#3987e5"/><text x="594" y="395" font-size="11.5" fill="#f0efec">251.4</text></g>
-<g><title>redcrab max: consumer 348.4 MB/s; earlier run 344.6 MB/s</title><rect x="522" y="433.5" width="90.4" height="3" rx="1.5" fill="#898781"/><path d="M522 416H609.5A4 4 0 0 1 613.5 420V426A4 4 0 0 1 609.5 430H522Z" fill="#3987e5"/><text x="619.5" y="427" font-size="11.5" fill="#f0efec">348.4</text></g>
+<g><title>redcrab max: consumer 410.4 MB/s; earlier run 393.5 MB/s</title><rect x="522" y="433.5" width="103.3" height="3" rx="1.5" fill="#898781"/><path d="M522 416H625.7A4 4 0 0 1 629.7 420V426A4 4 0 0 1 625.7 430H522Z" fill="#3987e5"/><text x="635.7" y="427" font-size="11.5" fill="#f0efec">410.4</text></g>
 <g><title>kafka small-batch: consumer 292.5 MB/s</title><path d="M522 480H594.8A4 4 0 0 1 598.8 484V490A4 4 0 0 1 594.8 494H522Z" fill="#3987e5"/><text x="604.8" y="491" font-size="11.5" fill="#f0efec">292.5</text></g>
 <g><title>kafka-fsync small-batch: consumer 336.8 MB/s</title><path d="M522 506H606.4A4 4 0 0 1 610.4 510V516A4 4 0 0 1 606.4 520H522Z" fill="#3987e5"/><text x="616.4" y="517" font-size="11.5" fill="#f0efec">336.8</text></g>
 <g><title>redpanda small-batch: consumer 266.2 MB/s</title><path d="M522 532H587.9A4 4 0 0 1 591.9 536V542A4 4 0 0 1 587.9 546H522Z" fill="#3987e5"/><text x="597.9" y="543" font-size="11.5" fill="#f0efec">266.2</text></g>
@@ -120,7 +120,12 @@
 <text x="16" y="855" font-size="11" fill="#c3c2b7">Broker settings (from the result files): kafka and kafka-fsync: heap -Xms128m -Xmx128m; redpanda: --smp=1</text>
 <text x="16" y="870" font-size="11" fill="#c3c2b7">--memory=256M; redcrab: container cap only. Containers have no CPU limit.</text>
 <text x="16" y="889" font-size="11" fill="#c3c2b7">Each row has 1 to 3 runs of 30-60 s with the same settings: the colored marks and values show the latest run and the</text>
-<text x="16" y="904" font-size="11" fill="#c3c2b7">thin gray marks under them the earlier runs. Results vary widely between runs (for example, kafka-fsync baseline p99</text>
-<text x="16" y="919" font-size="11" fill="#c3c2b7">was 27, 159 and 8 ms in 3 runs). Latency percentiles have 1 ms resolution.</text>
-<text x="16" y="938" font-size="11" fill="#c3c2b7">Runs from 2026-11-14. Full table: python3 bench/bench.py compare (with --all for every run).</text>
+<text x="16" y="904" font-size="11" fill="#c3c2b7">thin gray marks under them the earlier runs. Results vary widely between runs (for example, redcrab max p99 was</text>
+<text x="16" y="919" font-size="11" fill="#c3c2b7">1,116 and 25 ms in 2 runs). Latency percentiles have 1 ms resolution.</text>
+<text x="16" y="938" font-size="11" fill="#c3c2b7">Rows marked capped hit the harness&#x27;s cap of 12 GiB written per run, replicas and probe included, so each run sent</text>
+<text x="16" y="953" font-size="11" fill="#c3c2b7">fewer records than its probe planned for the full time, unlike the unmarked rows. At the rates they measured,</text>
+<text x="16" y="968" font-size="11" fill="#c3c2b7">redcrab max ran about 41 and 28 s instead of 30 s.</text>
+<text x="16" y="987" font-size="11" fill="#c3c2b7">The kafka max, kafka-fsync max and redpanda max rows ran before the record cap; at the rates their probes measured,</text>
+<text x="16" y="1002" font-size="11" fill="#c3c2b7">it would not have cut any of them.</text>
+<text x="16" y="1021" font-size="11" fill="#c3c2b7">Runs from 2026-11-14 to 2026-11-15. Full table: python3 bench/bench.py compare (with --all for every run).</text>
 </svg>
